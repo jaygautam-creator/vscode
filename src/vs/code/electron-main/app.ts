@@ -7,6 +7,11 @@ import { app, powerMonitor, protocol, session, Session, systemPreferences, WebFr
 import { addUNCHostToAllowlist, disableUNCAccessRestrictions } from '../../base/node/unc.js';
 import { validatedIpcMain } from '../../base/parts/ipc/electron-main/ipcMain.js';
 import { hostname, release } from 'os';
+import { spawn, ChildProcess } from 'child_process';
+import { existsSync } from 'fs';
+import * as nodeHttp from 'http';
+import * as nodeHttps from 'https';
+import * as nodePath from 'path';
 import { VSBuffer } from '../../base/common/buffer.js';
 import { toErrorMessage } from '../../base/common/errorMessage.js';
 import { Event } from '../../base/common/event.js';
@@ -76,7 +81,6 @@ import { IUpdateService } from '../../platform/update/common/update.js';
 import { UpdateChannel } from '../../platform/update/common/updateIpc.js';
 import { DarwinUpdateService } from '../../platform/update/electron-main/updateService.darwin.js';
 import { LinuxUpdateService } from '../../platform/update/electron-main/updateService.linux.js';
-import { SnapUpdateService } from '../../platform/update/electron-main/updateService.snap.js';
 import { Win32UpdateService } from '../../platform/update/electron-main/updateService.win32.js';
 import { IOpenURLOptions, IURLService } from '../../platform/url/common/url.js';
 import { URLHandlerChannelClient, URLHandlerRouter } from '../../platform/url/common/urlIpc.js';
@@ -125,6 +129,295 @@ import { IWebContentExtractorService } from '../../platform/webContentExtractor/
 import { NativeWebContentExtractorService } from '../../platform/webContentExtractor/electron-main/webContentExtractorService.js';
 import ErrorTelemetry from '../../platform/telemetry/electron-main/errorTelemetry.js';
 
+class YuvaDevBackendSupervisor extends Disposable {
+
+	private static readonly DEFAULT_BACKEND_URL = 'http://127.0.0.1:8000';
+	private static readonly STARTUP_TIMEOUT_MS = 30000;
+	private static readonly HEALTH_CHECK_INTERVAL_MS = 500;
+	private static readonly RESTART_LIMIT = 5;
+
+	private backendProcess: ChildProcess | undefined;
+	private stopping = false;
+	private disposed = false;
+	private restartAttempts = 0;
+
+	constructor(
+		@IEnvironmentMainService private readonly environmentMainService: IEnvironmentMainService,
+		@IConfigurationService private readonly configurationService: IConfigurationService,
+		@ILogService private readonly logService: ILogService,
+	) {
+		super();
+	}
+
+	async start(): Promise<void> {
+		if (process.env['YUVADEV_DISABLE_EMBEDDED_BACKEND'] === '1') {
+			this.logService.info('[YuvaDev] Embedded backend startup disabled by YUVADEV_DISABLE_EMBEDDED_BACKEND=1.');
+			return;
+		}
+
+		if (this.configurationService.getValue<boolean>('yuvadev.backend.autoStart') === false) {
+			this.logService.info('[YuvaDev] Embedded backend startup disabled by yuvadev.backend.autoStart=false.');
+			return;
+		}
+
+		const target = this.resolveBackendTarget();
+		if (!target) {
+			return;
+		}
+
+		if (await this.checkBackendHealth(target.backendUrl, 1000)) {
+			this.logService.info(`[YuvaDev] Backend already healthy at ${target.backendUrl.toString()}.`);
+			return;
+		}
+
+		this.spawnBackend(target, false);
+		void this.waitForHealthyStartup(target.backendUrl);
+	}
+
+	override dispose(): void {
+		this.disposed = true;
+		this.stopBackend();
+		super.dispose();
+	}
+
+	private resolveBackendTarget(): { backendRoot: string; pythonExecutable: string; backendUrl: URL } | undefined {
+		const configuredUrl = this.configurationService.getValue<string>('yuvadev.apiUrl')?.trim();
+		const envUrl = process.env['YUVADEV_API_URL']?.trim();
+		const backendUrl = this.parseBackendUrl(configuredUrl || envUrl || YuvaDevBackendSupervisor.DEFAULT_BACKEND_URL);
+
+		if (!this.isLoopbackHost(backendUrl.hostname)) {
+			this.logService.info(`[YuvaDev] Skipping embedded backend startup because yuvadev.apiUrl is non-local: ${backendUrl.toString()}.`);
+			return undefined;
+		}
+
+		const candidates = new Set<string>();
+		const envRoot = process.env['YUVADEV_BACKEND_ROOT']?.trim();
+		if (envRoot) {
+			candidates.add(envRoot);
+		}
+
+		const appRoot = this.environmentMainService.appRoot;
+		candidates.add(nodePath.resolve(appRoot, '..', 'yuvadev-backend'));
+		candidates.add(nodePath.resolve(appRoot, '..', '..', 'yuvadev-backend'));
+		candidates.add(nodePath.resolve(appRoot, '..', '..', '..', 'yuvadev-backend'));
+		candidates.add(nodePath.resolve(process.cwd(), 'vscodium', 'yuvadev-backend'));
+		candidates.add(nodePath.resolve(process.cwd(), 'yuvadev-backend'));
+
+		for (const candidate of candidates) {
+			if (existsSync(nodePath.join(candidate, 'main.py'))) {
+				return {
+					backendRoot: candidate,
+					pythonExecutable: this.resolvePythonExecutable(candidate),
+					backendUrl,
+				};
+			}
+		}
+
+		this.logService.warn('[YuvaDev] Unable to locate yuvadev-backend/main.py. Set YUVADEV_BACKEND_ROOT to enable managed startup.');
+		return undefined;
+	}
+
+	private resolvePythonExecutable(backendRoot: string): string {
+		const envPython = process.env['YUVADEV_BACKEND_PYTHON']?.trim();
+		if (envPython) {
+			return envPython;
+		}
+
+		const venvCandidates = isWindows
+			? [
+				nodePath.join(backendRoot, '.venv', 'Scripts', 'python.exe'),
+				nodePath.join(backendRoot, '.venv', 'Scripts', 'python'),
+			]
+			: [
+				nodePath.join(backendRoot, '.venv', 'bin', 'python3'),
+				nodePath.join(backendRoot, '.venv', 'bin', 'python'),
+			];
+
+		for (const candidate of venvCandidates) {
+			if (existsSync(candidate)) {
+				return candidate;
+			}
+		}
+
+		return isWindows ? 'python' : 'python3';
+	}
+
+	private parseBackendUrl(rawUrl: string): URL {
+		try {
+			const parsed = new URL(rawUrl);
+			if (!parsed.port) {
+				parsed.port = parsed.protocol === 'https:' ? '443' : '80';
+			}
+			return parsed;
+		} catch {
+			return new URL(YuvaDevBackendSupervisor.DEFAULT_BACKEND_URL);
+		}
+	}
+
+	private isLoopbackHost(hostname: string): boolean {
+		const host = hostname.toLowerCase();
+		return host === '127.0.0.1' || host === 'localhost' || host === '::1';
+	}
+
+	private spawnBackend(target: { backendRoot: string; pythonExecutable: string; backendUrl: URL }, isRestart: boolean): void {
+		if (this.disposed) {
+			return;
+		}
+
+		this.stopping = false;
+
+		const args = [
+			'-m',
+			'uvicorn',
+			'main:app',
+			'--host',
+			target.backendUrl.hostname,
+			'--port',
+			target.backendUrl.port,
+		];
+
+		if (process.env['YUVADEV_BACKEND_RELOAD'] === '1') {
+			args.push('--reload');
+		}
+
+		this.logService.info(`[YuvaDev] ${isRestart ? 'Restarting' : 'Starting'} embedded backend: ${target.pythonExecutable} ${args.join(' ')} (cwd=${target.backendRoot})`);
+
+		const spawned = spawn(target.pythonExecutable, args, {
+			cwd: target.backendRoot,
+			env: {
+				...process.env,
+				PYTHONUNBUFFERED: '1',
+			},
+			stdio: ['ignore', 'pipe', 'pipe'],
+		});
+
+		this.backendProcess = spawned;
+
+		spawned.stdout.on('data', chunk => {
+			const text = chunk.toString().trim();
+			if (text) {
+				this.logService.trace(`[YuvaDev][backend] ${text}`);
+			}
+		});
+
+		spawned.stderr.on('data', chunk => {
+			const text = chunk.toString().trim();
+			if (text) {
+				this.logService.warn(`[YuvaDev][backend] ${text}`);
+			}
+		});
+
+		spawned.once('error', error => {
+			this.logService.error(`[YuvaDev] Embedded backend process error: ${error instanceof Error ? error.message : String(error)}`);
+			this.backendProcess = undefined;
+			this.scheduleRestart(target);
+		});
+
+		spawned.once('exit', (code, signal) => {
+			this.backendProcess = undefined;
+			if (this.stopping || this.disposed) {
+				return;
+			}
+			this.logService.error(`[YuvaDev] Embedded backend exited unexpectedly (code=${code ?? 'null'}, signal=${signal ?? 'none'}).`);
+			this.scheduleRestart(target);
+		});
+	}
+
+	private scheduleRestart(target: { backendRoot: string; pythonExecutable: string; backendUrl: URL }): void {
+		if (this.stopping || this.disposed) {
+			return;
+		}
+
+		if (this.restartAttempts >= YuvaDevBackendSupervisor.RESTART_LIMIT) {
+			this.logService.error(`[YuvaDev] Embedded backend restart limit reached (${YuvaDevBackendSupervisor.RESTART_LIMIT}).`);
+			return;
+		}
+
+		this.restartAttempts += 1;
+		const delayMs = 1000 * this.restartAttempts;
+		this.logService.warn(`[YuvaDev] Retrying embedded backend startup in ${delayMs}ms (${this.restartAttempts}/${YuvaDevBackendSupervisor.RESTART_LIMIT}).`);
+
+		setTimeout(() => {
+			if (this.stopping || this.disposed || this.backendProcess) {
+				return;
+			}
+			this.spawnBackend(target, true);
+			void this.waitForHealthyStartup(target.backendUrl);
+		}, delayMs);
+	}
+
+	private async waitForHealthyStartup(backendUrl: URL): Promise<void> {
+		const started = Date.now();
+		while (!this.stopping && !this.disposed && Date.now() - started < YuvaDevBackendSupervisor.STARTUP_TIMEOUT_MS) {
+			if (await this.checkBackendHealth(backendUrl, 1200)) {
+				this.restartAttempts = 0;
+				this.logService.info(`[YuvaDev] Embedded backend ready at ${backendUrl.toString()}.`);
+				return;
+			}
+
+			await new Promise<void>(resolve => setTimeout(resolve, YuvaDevBackendSupervisor.HEALTH_CHECK_INTERVAL_MS));
+		}
+
+		if (!this.stopping && !this.disposed) {
+			this.logService.warn(`[YuvaDev] Embedded backend did not report healthy status within ${YuvaDevBackendSupervisor.STARTUP_TIMEOUT_MS}ms.`);
+		}
+	}
+
+	private checkBackendHealth(backendUrl: URL, timeoutMs: number): Promise<boolean> {
+		const healthUrl = new URL('/health', backendUrl);
+		const requestModule = healthUrl.protocol === 'https:' ? nodeHttps : nodeHttp;
+
+		return new Promise(resolve => {
+			const req = requestModule.request({
+				method: 'GET',
+				hostname: healthUrl.hostname,
+				port: healthUrl.port,
+				path: healthUrl.pathname,
+				timeout: timeoutMs,
+			}, response => {
+				response.resume();
+				resolve((response.statusCode ?? 0) >= 200 && (response.statusCode ?? 0) < 300);
+			});
+
+			req.on('error', () => resolve(false));
+			req.on('timeout', () => {
+				req.destroy();
+				resolve(false);
+			});
+			req.end();
+		});
+	}
+
+	private stopBackend(): void {
+		this.stopping = true;
+		const running = this.backendProcess;
+		this.backendProcess = undefined;
+		if (!running || running.killed) {
+			return;
+		}
+
+		this.logService.info('[YuvaDev] Stopping embedded backend process.');
+
+		try {
+			running.kill('SIGTERM');
+		} catch {
+			return;
+		}
+
+		const killTimeout = setTimeout(() => {
+			if (!running.killed) {
+				try {
+					running.kill('SIGKILL');
+				} catch {
+					// ignore force-kill failures
+				}
+			}
+		}, 5000);
+
+		running.once('exit', () => clearTimeout(killTimeout));
+	}
+}
+
 /**
  * The main VS Code application. There will only ever be one instance,
  * even if the user starts many instances (e.g. from the command line).
@@ -139,6 +432,7 @@ export class CodeApplication extends Disposable {
 	private windowsMainService: IWindowsMainService | undefined;
 	private auxiliaryWindowsMainService: IAuxiliaryWindowsMainService | undefined;
 	private nativeHostMainService: INativeHostMainService | undefined;
+	private yuvadevBackendSupervisor: YuvaDevBackendSupervisor | undefined;
 
 	constructor(
 		private readonly mainProcessNodeIpcServer: NodeIPCServer,
@@ -530,7 +824,7 @@ export class CodeApplication extends Disposable {
 	}
 
 	async startup(): Promise<void> {
-		this.logService.debug('Starting VS Code');
+		this.logService.debug('Starting VSCodium');
 		this.logService.debug(`from: ${this.environmentMainService.appRoot}`);
 		this.logService.debug('args:', this.environmentMainService.args);
 
@@ -600,6 +894,10 @@ export class CodeApplication extends Disposable {
 
 		// Setup vscode-remote-resource protocol handler
 		this.setupManagedRemoteResourceUrlHandler(mainProcessElectronServer);
+
+		// Start the YuvaDev backend process as part of the native desktop lifecycle.
+		this.yuvadevBackendSupervisor = this._register(appInstantiationService.createInstance(YuvaDevBackendSupervisor));
+		void this.yuvadevBackendSupervisor.start();
 
 		// Signal phase: ready - before opening first window
 		this.lifecycleMainService.phase = LifecycleMainPhase.Ready;
@@ -995,7 +1293,7 @@ export class CodeApplication extends Disposable {
 
 			case 'linux':
 				if (isLinuxSnap) {
-					services.set(IUpdateService, new SyncDescriptor(SnapUpdateService, [process.env['SNAP'], process.env['SNAP_REVISION']]));
+					// services.set(IUpdateService, new SyncDescriptor(SnapUpdateService, [process.env['SNAP'], process.env['SNAP_REVISION']]));
 				} else {
 					services.set(IUpdateService, new SyncDescriptor(LinuxUpdateService));
 				}
