@@ -22,6 +22,7 @@ import product from '../../../../platform/product/common/product.js';
 import { IQuickInputService, IQuickPickItem } from '../../../../platform/quickinput/common/quickInput.js';
 import { Registry } from '../../../../platform/registry/common/platform.js';
 import { asJson, IRequestService } from '../../../../platform/request/common/request.js';
+import { ISecretStorageService } from '../../../../platform/secrets/common/secrets.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { ICommandService } from '../../../../platform/commands/common/commands.js';
 import { registerWorkbenchContribution2, WorkbenchPhase } from '../../../common/contributions.js';
@@ -38,6 +39,9 @@ const YUVADEV_CLOUD_PROVIDER_SETTING = 'yuvadev.cloudProvider';
 const YUVADEV_LOCAL_MODEL_SETTING = 'yuvadev.localModel';
 const YUVADEV_ONBOARDING_OPEN_SETTING = 'yuvadev.onboarding.openOnStartup';
 const YUVADEV_BACKEND_AUTOSTART_SETTING = 'yuvadev.backend.autoStart';
+const YUVADEV_AUTH_ACCESS_TOKEN_SECRET = 'yuvadev.auth.accessToken';
+const YUVADEV_AUTH_REFRESH_TOKEN_SECRET = 'yuvadev.auth.refreshToken';
+const YUVADEV_AUTH_EMAIL_STORAGE_KEY = 'yuvadev.auth.email';
 
 type RuntimeMode = 'auto' | 'local' | 'cloud' | 'hybrid';
 type CloudProvider = 'auto' | 'anthropic' | 'openai' | 'deepseek';
@@ -90,6 +94,23 @@ type ProviderUpdatePayload = {
 	primary_provider?: string;
 	local_model?: string;
 };
+
+interface AuthTokenResponse {
+	access_token: string;
+	refresh_token: string;
+	token_type: string;
+}
+
+interface AuthRefreshResponse {
+	access_token: string;
+	token_type: string;
+}
+
+interface AuthUserProfile {
+	user_id: string;
+	email: string;
+	is_active: boolean;
+}
 
 const configurationRegistry = Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration);
 configurationRegistry.registerConfiguration({
@@ -269,6 +290,16 @@ function createYuvaDevWalkthrough(): IWalkthroughLoose {
 				completionEvents: ['onCommand:yuvadev.pullLocalModel'],
 				media: getWalkthroughMedia(),
 			},
+			{
+				id: 'yuvadev.account',
+				title: localize('yuvadev.walkthrough.account.title', 'Sign in to your YuvaDev account'),
+				description: localize('yuvadev.walkthrough.account.description', 'Sign in for cloud entitlements, paid routing, and account-linked workspace sessions.\n[Sign In](command:yuvadev.signInAccount)\n[Check Account Status](command:yuvadev.checkAccountStatus)'),
+				category: YUVADEV_WALKTHROUGH_ID,
+				when: ContextKeyExpr.true(),
+				order: 5,
+				completionEvents: ['onCommand:yuvadev.signInAccount'],
+				media: getWalkthroughMedia(),
+			},
 		],
 	};
 }
@@ -276,19 +307,34 @@ function createYuvaDevWalkthrough(): IWalkthroughLoose {
 async function requestJson<T>(
 	requestService: IRequestService,
 	url: string,
-	options: { type?: string; data?: string } = {},
+	options: { type?: string; data?: string; headers?: Record<string, string> } = {},
 ): Promise<T> {
+	const headers = { ...(options.headers ?? {}) };
+	if (options.data && !headers['Content-Type']) {
+		headers['Content-Type'] = 'application/json';
+	}
+
 	const response = await requestService.request({
 		type: options.type ?? 'GET',
 		url,
 		data: options.data,
-		headers: options.data ? { 'Content-Type': 'application/json' } : undefined,
+		headers: Object.keys(headers).length > 0 ? headers : undefined,
 	}, CancellationToken.None);
-	const data = await asJson<T>(response);
+
+	const statusCode = response.res.statusCode ?? 0;
+	const data = await asJson<T & { detail?: string; message?: string }>(response);
+
+	if (statusCode >= 400) {
+		const detail = data && typeof data === 'object'
+			? String(data.detail ?? data.message ?? localize('yuvadev.request.errorUnknown', 'Unknown error'))
+			: localize('yuvadev.request.errorUnknown', 'Unknown error');
+		throw new Error(localize('yuvadev.request.failed', 'YuvaDev backend request failed ({0}): {1}', statusCode, detail));
+	}
+
 	if (!data) {
 		throw new Error(localize('yuvadev.request.empty', 'YuvaDev backend returned an empty response.'));
 	}
-	return data;
+	return data as T;
 }
 
 async function persistRuntimeSelection(
@@ -315,6 +361,109 @@ async function promptForCloudProvider(
 	return picked?.value;
 }
 
+function formEncode(data: Record<string, string>): string {
+	return Object.entries(data)
+		.map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
+		.join('&');
+}
+
+async function readAuthTokens(secretStorageService: ISecretStorageService): Promise<{ accessToken?: string; refreshToken?: string }> {
+	const [accessToken, refreshToken] = await Promise.all([
+		secretStorageService.get(YUVADEV_AUTH_ACCESS_TOKEN_SECRET),
+		secretStorageService.get(YUVADEV_AUTH_REFRESH_TOKEN_SECRET),
+	]);
+
+	return { accessToken: accessToken || undefined, refreshToken: refreshToken || undefined };
+}
+
+async function clearAuthTokens(secretStorageService: ISecretStorageService): Promise<void> {
+	await Promise.all([
+		secretStorageService.delete(YUVADEV_AUTH_ACCESS_TOKEN_SECRET),
+		secretStorageService.delete(YUVADEV_AUTH_REFRESH_TOKEN_SECRET),
+	]);
+}
+
+async function refreshYuvaDevAccessToken(
+	configurationService: IConfigurationService,
+	requestService: IRequestService,
+	secretStorageService: ISecretStorageService,
+): Promise<string | undefined> {
+	const refreshToken = await secretStorageService.get(YUVADEV_AUTH_REFRESH_TOKEN_SECRET);
+	if (!refreshToken) {
+		return undefined;
+	}
+
+	const refreshed = await requestJson<AuthRefreshResponse>(
+		requestService,
+		`${getApiUrl(configurationService)}/api/auth/refresh`,
+		{ type: 'POST', data: JSON.stringify({ refresh_token: refreshToken }) },
+	);
+
+	await secretStorageService.set(YUVADEV_AUTH_ACCESS_TOKEN_SECRET, refreshed.access_token);
+	return refreshed.access_token;
+}
+
+async function fetchYuvaDevProfile(
+	configurationService: IConfigurationService,
+	requestService: IRequestService,
+	secretStorageService: ISecretStorageService,
+): Promise<AuthUserProfile> {
+	const tokens = await readAuthTokens(secretStorageService);
+	let accessToken = tokens.accessToken;
+
+	if (!accessToken) {
+		accessToken = await refreshYuvaDevAccessToken(configurationService, requestService, secretStorageService);
+	}
+
+	if (!accessToken) {
+		throw new Error(localize('yuvadev.auth.notSignedIn', 'No active YuvaDev account session found.'));
+	}
+
+	try {
+		return await requestJson<AuthUserProfile>(
+			requestService,
+			`${getApiUrl(configurationService)}/api/auth/me`,
+			{ headers: { Authorization: `Bearer ${accessToken}` } },
+		);
+	} catch {
+		const refreshedAccess = await refreshYuvaDevAccessToken(configurationService, requestService, secretStorageService);
+		if (!refreshedAccess) {
+			throw new Error(localize('yuvadev.auth.sessionExpired', 'Your YuvaDev session expired. Please sign in again.'));
+		}
+
+		return requestJson<AuthUserProfile>(
+			requestService,
+			`${getApiUrl(configurationService)}/api/auth/me`,
+			{ headers: { Authorization: `Bearer ${refreshedAccess}` } },
+		);
+	}
+}
+
+async function confirmWizardStep(
+	quickInputService: IQuickInputService,
+	title: string,
+	detail: string,
+): Promise<boolean> {
+	const picked = await quickInputService.pick<ValueQuickPickItem<'yes' | 'skip'>>([
+		{
+			label: localize('yuvadev.wizard.choice.continue', 'Continue'),
+			description: localize('yuvadev.wizard.choice.continue.description', 'Run this setup step now'),
+			value: 'yes',
+		},
+		{
+			label: localize('yuvadev.wizard.choice.skip', 'Skip for now'),
+			description: localize('yuvadev.wizard.choice.skip.description', 'You can run this step later from Command Palette'),
+			value: 'skip',
+		},
+	], {
+		title,
+		placeHolder: detail,
+		ignoreFocusLost: true,
+	});
+
+	return picked?.value === 'yes';
+}
+
 registerAction2(class OpenYuvaDevSetupAction extends Action2 {
 	constructor() {
 		super({
@@ -333,7 +482,222 @@ registerAction2(class OpenYuvaDevSetupAction extends Action2 {
 	}
 
 	async run(accessor: ServicesAccessor): Promise<void> {
-		await accessor.get(ICommandService).executeCommand('workbench.action.openWalkthrough', YUVADEV_WALKTHROUGH_ID);
+		await accessor.get(ICommandService).executeCommand('yuvadev.runOnboardingWizard');
+	}
+});
+
+registerAction2(class RunYuvaDevOnboardingWizardAction extends Action2 {
+	constructor() {
+		super({
+			id: 'yuvadev.runOnboardingWizard',
+			title: localize2('yuvadev.runOnboardingWizard', 'Run YuvaDev Setup Wizard'),
+			category: YUVADEV_CATEGORY,
+			f1: true,
+			precondition: ContextKeyExpr.not('isWeb'),
+		});
+	}
+
+	async run(accessor: ServicesAccessor): Promise<void> {
+		const quickInputService = accessor.get(IQuickInputService);
+		const commandService = accessor.get(ICommandService);
+		const configurationService = accessor.get(IConfigurationService);
+		const notificationService = accessor.get(INotificationService);
+
+		const shouldStart = await confirmWizardStep(
+			quickInputService,
+			localize('yuvadev.wizard.start.title', 'YuvaDev Guided Setup'),
+			localize('yuvadev.wizard.start.detail', 'Run the full setup now: runtime mode, language, health checks, providers, local model, and account sign-in.'),
+		);
+
+		if (!shouldStart) {
+			await commandService.executeCommand('workbench.action.openWalkthrough', YUVADEV_WALKTHROUGH_ID);
+			return;
+		}
+
+		await commandService.executeCommand('yuvadev.chooseRuntimeMode');
+		await commandService.executeCommand('yuvadev.chooseLanguage');
+		await commandService.executeCommand('yuvadev.checkBackendHealth');
+
+		const runtimeMode = getRuntimeMode(configurationService);
+
+		if (runtimeMode !== 'local') {
+			const shouldConfigureCloud = await confirmWizardStep(
+				quickInputService,
+				localize('yuvadev.wizard.cloud.title', 'Configure Cloud Provider'),
+				localize('yuvadev.wizard.cloud.detail', 'Connect Anthropic, OpenAI, or DeepSeek for paid cloud execution.'),
+			);
+			if (shouldConfigureCloud) {
+				await commandService.executeCommand('yuvadev.configureProviderKey');
+			}
+		}
+
+		if (runtimeMode !== 'cloud') {
+			const shouldPullModel = await confirmWizardStep(
+				quickInputService,
+				localize('yuvadev.wizard.local.title', 'Prepare Local Model'),
+				localize('yuvadev.wizard.local.detail', 'Pull an Ollama model for free local execution.'),
+			);
+			if (shouldPullModel) {
+				await commandService.executeCommand('yuvadev.pullLocalModel');
+			}
+		}
+
+		const shouldSignIn = await confirmWizardStep(
+			quickInputService,
+			localize('yuvadev.wizard.account.title', 'Sign In Account'),
+			localize('yuvadev.wizard.account.detail', 'Sign in to your YuvaDev account for cloud entitlements and paid features.'),
+		);
+		if (shouldSignIn) {
+			await commandService.executeCommand('yuvadev.signInAccount');
+		}
+
+		await commandService.executeCommand('workbench.action.openWalkthrough', YUVADEV_WALKTHROUGH_ID);
+		notificationService.info(localize(
+			'yuvadev.wizard.complete',
+			'YuvaDev guided setup is complete. You can rerun it anytime with "Run YuvaDev Setup Wizard".',
+		));
+	}
+});
+
+registerAction2(class SignInYuvaDevAccountAction extends Action2 {
+	constructor() {
+		super({
+			id: 'yuvadev.signInAccount',
+			title: localize2('yuvadev.signInAccount', 'Sign In to YuvaDev Account'),
+			category: YUVADEV_CATEGORY,
+			f1: true,
+			precondition: ContextKeyExpr.not('isWeb'),
+		});
+	}
+
+	async run(accessor: ServicesAccessor): Promise<void> {
+		const quickInputService = accessor.get(IQuickInputService);
+		const requestService = accessor.get(IRequestService);
+		const configurationService = accessor.get(IConfigurationService);
+		const notificationService = accessor.get(INotificationService);
+		const progressService = accessor.get(IProgressService);
+		const storageService = accessor.get(IStorageService);
+		const secretStorageService = accessor.get(ISecretStorageService);
+
+		const rememberedEmail = storageService.get(YUVADEV_AUTH_EMAIL_STORAGE_KEY, StorageScope.APPLICATION, '');
+		const email = await quickInputService.input({
+			title: localize('yuvadev.auth.email.title', 'YuvaDev Account Email'),
+			prompt: localize('yuvadev.auth.email.prompt', 'Enter your YuvaDev account email address.'),
+			value: rememberedEmail,
+			placeHolder: localize('yuvadev.auth.email.placeholder', 'you@company.com'),
+			validateInput: async value => value.includes('@') ? undefined : localize('yuvadev.auth.email.invalid', 'Enter a valid email address.'),
+		});
+
+		if (!email) {
+			return;
+		}
+
+		const password = await quickInputService.input({
+			title: localize('yuvadev.auth.password.title', 'YuvaDev Account Password'),
+			prompt: localize('yuvadev.auth.password.prompt', 'Enter your account password.'),
+			password: true,
+			validateInput: async value => value.trim().length > 0 ? undefined : localize('yuvadev.auth.password.required', 'Password is required.'),
+		});
+
+		if (!password) {
+			return;
+		}
+
+		try {
+			const tokenResponse = await progressService.withProgress<AuthTokenResponse>({
+				location: ProgressLocation.Notification,
+				title: localize('yuvadev.auth.signingIn', 'Signing in to YuvaDev account'),
+				cancellable: false,
+			}, async () => requestJson<AuthTokenResponse>(
+				requestService,
+				`${getApiUrl(configurationService)}/api/auth/login`,
+				{
+					type: 'POST',
+					data: formEncode({
+						username: email.trim(),
+						password: password,
+						grant_type: 'password',
+					}),
+					headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+				},
+			));
+
+			await Promise.all([
+				secretStorageService.set(YUVADEV_AUTH_ACCESS_TOKEN_SECRET, tokenResponse.access_token),
+				secretStorageService.set(YUVADEV_AUTH_REFRESH_TOKEN_SECRET, tokenResponse.refresh_token),
+			]);
+			storageService.store(YUVADEV_AUTH_EMAIL_STORAGE_KEY, email.trim(), StorageScope.APPLICATION, StorageTarget.USER);
+
+			const profile = await fetchYuvaDevProfile(configurationService, requestService, secretStorageService);
+			notificationService.info(localize(
+				'yuvadev.auth.login.success',
+				'Signed in as {0}. Account is active and ready for cloud-enabled YuvaDev sessions.',
+				profile.email,
+			));
+		} catch (error) {
+			await clearAuthTokens(secretStorageService);
+			notificationService.error(localize(
+				'yuvadev.auth.login.failed',
+				'YuvaDev sign-in failed: {0}',
+				error instanceof Error ? error.message : String(error),
+			));
+		}
+	}
+});
+
+registerAction2(class CheckYuvaDevAccountStatusAction extends Action2 {
+	constructor() {
+		super({
+			id: 'yuvadev.checkAccountStatus',
+			title: localize2('yuvadev.checkAccountStatus', 'Check YuvaDev Account Status'),
+			category: YUVADEV_CATEGORY,
+			f1: true,
+			precondition: ContextKeyExpr.not('isWeb'),
+		});
+	}
+
+	async run(accessor: ServicesAccessor): Promise<void> {
+		const requestService = accessor.get(IRequestService);
+		const configurationService = accessor.get(IConfigurationService);
+		const notificationService = accessor.get(INotificationService);
+		const secretStorageService = accessor.get(ISecretStorageService);
+
+		try {
+			const profile = await fetchYuvaDevProfile(configurationService, requestService, secretStorageService);
+			notificationService.info(localize(
+				'yuvadev.auth.status.active',
+				'YuvaDev account is connected: {0} (active: {1}).',
+				profile.email,
+				profile.is_active ? 'yes' : 'no',
+			));
+		} catch (error) {
+			await clearAuthTokens(secretStorageService);
+			notificationService.warn(localize(
+				'yuvadev.auth.status.none',
+				'No valid YuvaDev account session found. Sign in to enable account-linked features. ({0})',
+				error instanceof Error ? error.message : String(error),
+			));
+		}
+	}
+});
+
+registerAction2(class SignOutYuvaDevAccountAction extends Action2 {
+	constructor() {
+		super({
+			id: 'yuvadev.signOutAccount',
+			title: localize2('yuvadev.signOutAccount', 'Sign Out from YuvaDev Account'),
+			category: YUVADEV_CATEGORY,
+			f1: true,
+			precondition: ContextKeyExpr.not('isWeb'),
+		});
+	}
+
+	async run(accessor: ServicesAccessor): Promise<void> {
+		const secretStorageService = accessor.get(ISecretStorageService);
+		const notificationService = accessor.get(INotificationService);
+
+		await clearAuthTokens(secretStorageService);
+		notificationService.info(localize('yuvadev.auth.signOut.complete', 'Signed out from YuvaDev account on this device.'));
 	}
 });
 
@@ -769,7 +1133,9 @@ class YuvaDevOnboardingContribution {
 		}
 
 		storageService.store(YUVADEV_WALKTHROUGH_OPENED_KEY, true, StorageScope.APPLICATION, StorageTarget.USER);
-		void commandService.executeCommand('workbench.action.openWalkthrough', YUVADEV_WALKTHROUGH_ID);
+		void commandService.executeCommand('yuvadev.runOnboardingWizard').catch(() => {
+			void commandService.executeCommand('workbench.action.openWalkthrough', YUVADEV_WALKTHROUGH_ID);
+		});
 	}
 }
 
