@@ -37,6 +37,7 @@ const YUVADEV_RUNTIME_MODE_SETTING = 'yuvadev.runtimeMode';
 const YUVADEV_DEFAULT_LANGUAGE_SETTING = 'yuvadev.defaultLanguage';
 const YUVADEV_CLOUD_PROVIDER_SETTING = 'yuvadev.cloudProvider';
 const YUVADEV_LOCAL_MODEL_SETTING = 'yuvadev.localModel';
+const YUVADEV_OLLAMA_CLOUD_MODEL_SETTING = 'yuvadev.ollamaCloudModel';
 const YUVADEV_ONBOARDING_OPEN_SETTING = 'yuvadev.onboarding.openOnStartup';
 const YUVADEV_BACKEND_AUTOSTART_SETTING = 'yuvadev.backend.autoStart';
 const YUVADEV_AUTH_ACCESS_TOKEN_SECRET = 'yuvadev.auth.accessToken';
@@ -44,7 +45,9 @@ const YUVADEV_AUTH_REFRESH_TOKEN_SECRET = 'yuvadev.auth.refreshToken';
 const YUVADEV_AUTH_EMAIL_STORAGE_KEY = 'yuvadev.auth.email';
 
 type RuntimeMode = 'auto' | 'local' | 'cloud' | 'hybrid';
-type CloudProvider = 'auto' | 'anthropic' | 'openai' | 'deepseek';
+type CloudProvider = 'auto' | 'ollama_cloud' | 'yuvadev_paid' | 'anthropic' | 'openai' | 'deepseek';
+type AccessMode = 'local_unlimited' | 'ollama_cloud_byok' | 'yuvadev_paid';
+type ConfigurableCloudProvider = 'ollama_cloud' | 'yuvadev_paid';
 
 interface ValueQuickPickItem<T extends string> extends IQuickPickItem {
 	value: T;
@@ -84,15 +87,18 @@ interface ProviderSaveResponse {
 	runtime?: {
 		primary_provider?: string;
 		local_model?: string;
+		ollama_cloud_model?: string;
 	};
 }
 
 type ProviderUpdatePayload = {
+	ollama_cloud?: string;
 	anthropic?: string;
 	openai?: string;
 	deepseek?: string;
 	primary_provider?: string;
 	local_model?: string;
+	ollama_cloud_model?: string;
 };
 
 interface AuthTokenResponse {
@@ -110,6 +116,38 @@ interface AuthUserProfile {
 	user_id: string;
 	email: string;
 	is_active: boolean;
+}
+
+interface UsageMetricValues {
+	tokens: number;
+	agent_loops: number;
+	build_minutes: number;
+}
+
+interface UsagePercentValues {
+	tokens: number;
+	agent_loops: number;
+	build_minutes: number;
+}
+
+interface UsageBudgetResponse {
+	user_id: string;
+	email: string;
+	plan: string;
+	source: string;
+	primary_provider: string;
+	local_unlimited: boolean;
+	usage_policy: 'local_unlimited' | 'provider_managed' | 'yuvadev_metered';
+	period_key: string;
+	period_start: string;
+	period_end: string;
+	usage: UsageMetricValues;
+	limits: UsageMetricValues;
+	remaining: UsageMetricValues;
+	percent_used: UsagePercentValues;
+	completed_sessions: number;
+	active_sessions: number;
+	alerts: string[];
 }
 
 const configurationRegistry = Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration);
@@ -140,16 +178,22 @@ configurationRegistry.registerConfiguration({
 		},
 		[YUVADEV_CLOUD_PROVIDER_SETTING]: {
 			type: 'string',
-			enum: ['auto', 'anthropic', 'openai', 'deepseek'],
+			enum: ['auto', 'ollama_cloud', 'yuvadev_paid', 'anthropic', 'openai', 'deepseek'],
 			default: 'auto',
 			scope: ConfigurationScope.APPLICATION,
-			description: localize('yuvadev.configuration.cloudProvider', 'Preferred cloud provider when YuvaDev is running in cloud mode.'),
+			description: localize('yuvadev.configuration.cloudProvider', 'Preferred cloud mode provider when YuvaDev is running outside local unlimited mode.'),
 		},
 		[YUVADEV_LOCAL_MODEL_SETTING]: {
 			type: 'string',
 			default: 'qwen3:4b',
 			scope: ConfigurationScope.APPLICATION_MACHINE,
 			description: localize('yuvadev.configuration.localModel', 'Default Ollama model that YuvaDev should use for local runs.'),
+		},
+		[YUVADEV_OLLAMA_CLOUD_MODEL_SETTING]: {
+			type: 'string',
+			default: 'qwen3-coder:480b',
+			scope: ConfigurationScope.APPLICATION_MACHINE,
+			description: localize('yuvadev.configuration.ollamaCloudModel', 'Model ID for Ollama Cloud BYOK sessions.'),
 		},
 		[YUVADEV_ONBOARDING_OPEN_SETTING]: {
 			type: 'boolean',
@@ -183,8 +227,31 @@ function getLocalModel(configurationService: IConfigurationService): string {
 	return configurationService.getValue<string>(YUVADEV_LOCAL_MODEL_SETTING)?.trim() || 'qwen3:4b';
 }
 
+function getOllamaCloudModel(configurationService: IConfigurationService): string {
+	return configurationService.getValue<string>(YUVADEV_OLLAMA_CLOUD_MODEL_SETTING)?.trim() || 'qwen3-coder:480b';
+}
+
+function getAccessModeFromSettings(configurationService: IConfigurationService): AccessMode {
+	const runtimeMode = getRuntimeMode(configurationService);
+	const cloudProvider = getCloudProvider(configurationService);
+
+	if (runtimeMode === 'local') {
+		return 'local_unlimited';
+	}
+	if (cloudProvider === 'ollama_cloud') {
+		return 'ollama_cloud_byok';
+	}
+	return 'yuvadev_paid';
+}
+
+function isConfigurableCloudProvider(provider: CloudProvider): provider is ConfigurableCloudProvider {
+	return provider === 'ollama_cloud' || provider === 'yuvadev_paid';
+}
+
 function providerLabel(provider: string): string {
 	switch (provider) {
+		case 'ollama_cloud': return 'Ollama Cloud (BYOK)';
+		case 'yuvadev_paid': return 'YuvaDev Paid Models';
 		case 'anthropic': return 'Anthropic Claude';
 		case 'openai': return 'OpenAI GPT';
 		case 'deepseek': return 'DeepSeek';
@@ -196,22 +263,16 @@ function providerLabel(provider: string): string {
 function getCloudProviderItems(): ValueQuickPickItem<CloudProvider>[] {
 	return [
 		{
-			label: 'Anthropic Claude',
-			description: 'Paid cloud',
-			detail: 'Use Claude models with your Anthropic key.',
-			value: 'anthropic',
+			label: 'Ollama Cloud BYOK',
+			description: 'Use your own Ollama API key',
+			detail: 'YuvaDev sends requests using your Ollama Cloud key and your selected model.',
+			value: 'ollama_cloud',
 		},
 		{
-			label: 'OpenAI GPT',
-			description: 'Paid cloud',
-			detail: 'Use GPT models with your OpenAI key.',
-			value: 'openai',
-		},
-		{
-			label: 'DeepSeek',
-			description: 'Paid cloud',
-			detail: 'Use DeepSeek models with your DeepSeek key.',
-			value: 'deepseek',
+			label: 'YuvaDev Paid Models',
+			description: 'Managed paid routing',
+			detail: 'Use YuvaDev paid model routing with platform-managed limits and entitlements.',
+			value: 'yuvadev_paid',
 		},
 	];
 }
@@ -232,7 +293,7 @@ function createYuvaDevWalkthrough(): IWalkthroughLoose {
 	return {
 		id: YUVADEV_WALKTHROUGH_ID,
 		title: localize('yuvadev.walkthrough.title', 'Set up YuvaDev'),
-		description: localize('yuvadev.walkthrough.description', 'Choose local or cloud execution, connect providers, and get your first model ready.'),
+		description: localize('yuvadev.walkthrough.description', 'Choose local unlimited, Ollama Cloud BYOK, or YuvaDev paid mode, then finish account and model setup.'),
 		order: 2_000,
 		source: product.nameShort,
 		isFeatured: true,
@@ -242,8 +303,8 @@ function createYuvaDevWalkthrough(): IWalkthroughLoose {
 		steps: [
 			{
 				id: 'yuvadev.runtimeMode',
-				title: localize('yuvadev.walkthrough.runtime.title', 'Choose local, cloud, or hybrid mode'),
-				description: localize('yuvadev.walkthrough.runtime.description', 'Tell YuvaDev whether to prefer local Ollama, a paid cloud provider, or automatic fallback.\n[Choose Runtime Mode](command:yuvadev.chooseRuntimeMode)'),
+				title: localize('yuvadev.walkthrough.runtime.title', 'Choose your access mode'),
+				description: localize('yuvadev.walkthrough.runtime.description', 'Pick one: local unlimited (your own machine), Ollama Cloud BYOK, or YuvaDev paid models.\n[Choose Runtime Mode](command:yuvadev.chooseRuntimeMode)'),
 				category: YUVADEV_WALKTHROUGH_ID,
 				when: ContextKeyExpr.true(),
 				order: 0,
@@ -272,8 +333,8 @@ function createYuvaDevWalkthrough(): IWalkthroughLoose {
 			},
 			{
 				id: 'yuvadev.providerKey',
-				title: localize('yuvadev.walkthrough.provider.title', 'Connect a cloud provider'),
-				description: localize('yuvadev.walkthrough.provider.description', 'Add an Anthropic, OpenAI, or DeepSeek key so YuvaDev can run paid cloud sessions inside the IDE.\n[Add Provider Key](command:yuvadev.configureProviderKey)'),
+				title: localize('yuvadev.walkthrough.provider.title', 'Configure cloud access'),
+				description: localize('yuvadev.walkthrough.provider.description', 'For Ollama Cloud BYOK, add your own API key and cloud model ID. For YuvaDev paid mode, just select paid routing (no BYOK key required).\n[Configure Cloud Access](command:yuvadev.configureProviderKey)'),
 				category: YUVADEV_WALKTHROUGH_ID,
 				when: ContextKeyExpr.true(),
 				order: 3,
@@ -293,7 +354,7 @@ function createYuvaDevWalkthrough(): IWalkthroughLoose {
 			{
 				id: 'yuvadev.account',
 				title: localize('yuvadev.walkthrough.account.title', 'Sign in to your YuvaDev account'),
-				description: localize('yuvadev.walkthrough.account.description', 'Sign in for cloud entitlements, paid routing, and account-linked workspace sessions.\n[Sign In](command:yuvadev.signInAccount)\n[Check Account Status](command:yuvadev.checkAccountStatus)'),
+				description: localize('yuvadev.walkthrough.account.description', 'Sign in for cloud entitlements, paid routing, and account-linked workspace sessions.\n[Sign In](command:yuvadev.signInAccount)\n[Check Account Status](command:yuvadev.checkAccountStatus)\n[Check Usage & Budget](command:yuvadev.checkUsageAndBudget)'),
 				category: YUVADEV_WALKTHROUGH_ID,
 				when: ContextKeyExpr.true(),
 				order: 5,
@@ -356,15 +417,110 @@ async function promptForCloudProvider(
 ): Promise<CloudProvider | undefined> {
 	const items = getCloudProviderItems().map(item => ({ ...item, picked: item.value === currentProvider }));
 	const picked = await quickInputService.pick(items, {
-		placeHolder: localize('yuvadev.cloudProvider.placeholder', 'Choose the cloud provider YuvaDev should prefer'),
+		placeHolder: localize('yuvadev.cloudProvider.placeholder', 'Choose your cloud access option'),
 	});
 	return picked?.value;
+}
+
+async function configureCloudProviderAccess(
+	accessor: ServicesAccessor,
+	provider: ConfigurableCloudProvider,
+): Promise<boolean> {
+	const quickInputService = accessor.get(IQuickInputService);
+	const configurationService = accessor.get(IConfigurationService);
+	const notificationService = accessor.get(INotificationService);
+
+	if (provider === 'yuvadev_paid') {
+		await configurationService.updateValue(YUVADEV_CLOUD_PROVIDER_SETTING, provider, ConfigurationTarget.APPLICATION);
+		await configurationService.updateValue(YUVADEV_RUNTIME_MODE_SETTING, 'cloud', ConfigurationTarget.APPLICATION);
+		try {
+			await persistRuntimeSelection(accessor, { primary_provider: 'yuvadev_paid' });
+			notificationService.info(localize(
+				'yuvadev.providerKey.paid.enabled',
+				'YuvaDev paid model routing is enabled. No personal cloud API key is required for this mode.',
+			));
+			return true;
+		} catch (error) {
+			notificationService.error(localize(
+				'yuvadev.providerKey.failed',
+				'Could not save the provider key: {0}',
+				error instanceof Error ? error.message : String(error),
+			));
+			return false;
+		}
+	}
+
+	const apiKey = await quickInputService.input({
+		title: localize('yuvadev.providerKey.title', 'Add Cloud Provider Key'),
+		prompt: localize('yuvadev.providerKey.prompt', 'Paste your {0} API key. The value will be stored by the YuvaDev backend.', providerLabel(provider)),
+		placeHolder: localize('yuvadev.providerKey.placeholder.ollamaCloud', 'ollama_...'),
+		password: true,
+		validateInput: async value => value.trim().length > 0 ? undefined : localize('yuvadev.providerKey.required', 'API key is required.'),
+	});
+
+	if (!apiKey) {
+		return false;
+	}
+
+	const model = await quickInputService.input({
+		title: localize('yuvadev.ollamaCloudModel.title', 'Ollama Cloud Model ID'),
+		prompt: localize('yuvadev.ollamaCloudModel.prompt', 'Enter the Ollama Cloud model ID to use with your API key.'),
+		placeHolder: getOllamaCloudModel(configurationService),
+		value: getOllamaCloudModel(configurationService),
+		validateInput: async value => value.trim().length > 0 ? undefined : localize('yuvadev.ollamaCloudModel.required', 'Model ID is required.'),
+	});
+
+	if (!model) {
+		return false;
+	}
+
+	const ollamaCloudModel = model.trim();
+	await configurationService.updateValue(YUVADEV_CLOUD_PROVIDER_SETTING, provider, ConfigurationTarget.APPLICATION);
+	await configurationService.updateValue(YUVADEV_RUNTIME_MODE_SETTING, 'cloud', ConfigurationTarget.APPLICATION);
+	await configurationService.updateValue(YUVADEV_OLLAMA_CLOUD_MODEL_SETTING, ollamaCloudModel, ConfigurationTarget.APPLICATION);
+
+	const payload: ProviderUpdatePayload = {
+		ollama_cloud: apiKey.trim(),
+		ollama_cloud_model: ollamaCloudModel,
+		primary_provider: provider,
+	};
+
+	try {
+		await persistRuntimeSelection(accessor, payload);
+		notificationService.info(localize(
+			'yuvadev.providerKey.saved',
+			'{0} key saved. YuvaDev can now use that cloud provider.',
+			providerLabel(provider),
+		));
+		return true;
+	} catch (error) {
+		notificationService.error(localize(
+			'yuvadev.providerKey.failed',
+			'Could not save the provider key: {0}',
+			error instanceof Error ? error.message : String(error),
+		));
+		return false;
+	}
 }
 
 function formEncode(data: Record<string, string>): string {
 	return Object.entries(data)
 		.map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
 		.join('&');
+}
+
+function formatUsageValue(value: number | undefined): string {
+	if (typeof value !== 'number' || !Number.isFinite(value)) {
+		return '0';
+	}
+	return value.toLocaleString();
+}
+
+function formatUsagePercent(value: number | undefined): string {
+	if (typeof value !== 'number' || !Number.isFinite(value)) {
+		return '0';
+	}
+	return value.toFixed(2);
 }
 
 async function readAuthTokens(secretStorageService: ISecretStorageService): Promise<{ accessToken?: string; refreshToken?: string }> {
@@ -403,11 +559,19 @@ async function refreshYuvaDevAccessToken(
 	return refreshed.access_token;
 }
 
-async function fetchYuvaDevProfile(
+async function requestWithYuvaDevAuth<T>(
 	configurationService: IConfigurationService,
 	requestService: IRequestService,
 	secretStorageService: ISecretStorageService,
-): Promise<AuthUserProfile> {
+	path: string,
+): Promise<T> {
+	const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+	const callWithToken = async (accessToken: string) => requestJson<T>(
+		requestService,
+		`${getApiUrl(configurationService)}${normalizedPath}`,
+		{ headers: { Authorization: `Bearer ${accessToken}` } },
+	);
+
 	const tokens = await readAuthTokens(secretStorageService);
 	let accessToken = tokens.accessToken;
 
@@ -420,23 +584,40 @@ async function fetchYuvaDevProfile(
 	}
 
 	try {
-		return await requestJson<AuthUserProfile>(
-			requestService,
-			`${getApiUrl(configurationService)}/api/auth/me`,
-			{ headers: { Authorization: `Bearer ${accessToken}` } },
-		);
+		return await callWithToken(accessToken);
 	} catch {
 		const refreshedAccess = await refreshYuvaDevAccessToken(configurationService, requestService, secretStorageService);
 		if (!refreshedAccess) {
 			throw new Error(localize('yuvadev.auth.sessionExpired', 'Your YuvaDev session expired. Please sign in again.'));
 		}
-
-		return requestJson<AuthUserProfile>(
-			requestService,
-			`${getApiUrl(configurationService)}/api/auth/me`,
-			{ headers: { Authorization: `Bearer ${refreshedAccess}` } },
-		);
+		return callWithToken(refreshedAccess);
 	}
+}
+
+async function fetchYuvaDevProfile(
+	configurationService: IConfigurationService,
+	requestService: IRequestService,
+	secretStorageService: ISecretStorageService,
+): Promise<AuthUserProfile> {
+	return requestWithYuvaDevAuth<AuthUserProfile>(
+		configurationService,
+		requestService,
+		secretStorageService,
+		'/api/auth/me',
+	);
+}
+
+async function fetchYuvaDevUsageBudget(
+	configurationService: IConfigurationService,
+	requestService: IRequestService,
+	secretStorageService: ISecretStorageService,
+): Promise<UsageBudgetResponse> {
+	return requestWithYuvaDevAuth<UsageBudgetResponse>(
+		configurationService,
+		requestService,
+		secretStorageService,
+		'/api/auth/usage',
+	);
 }
 
 async function confirmWizardStep(
@@ -506,7 +687,7 @@ registerAction2(class RunYuvaDevOnboardingWizardAction extends Action2 {
 		const shouldStart = await confirmWizardStep(
 			quickInputService,
 			localize('yuvadev.wizard.start.title', 'YuvaDev Guided Setup'),
-			localize('yuvadev.wizard.start.detail', 'Run the full setup now: runtime mode, language, health checks, providers, local model, and account sign-in.'),
+			localize('yuvadev.wizard.start.detail', 'Run the full setup now: choose local unlimited, Ollama Cloud BYOK, or YuvaDev paid mode, then complete language, health, provider, and account steps.'),
 		);
 
 		if (!shouldStart) {
@@ -518,20 +699,22 @@ registerAction2(class RunYuvaDevOnboardingWizardAction extends Action2 {
 		await commandService.executeCommand('yuvadev.chooseLanguage');
 		await commandService.executeCommand('yuvadev.checkBackendHealth');
 
-		const runtimeMode = getRuntimeMode(configurationService);
+		const accessMode = getAccessModeFromSettings(configurationService);
 
-		if (runtimeMode !== 'local') {
+		if (accessMode === 'ollama_cloud_byok' || accessMode === 'yuvadev_paid') {
 			const shouldConfigureCloud = await confirmWizardStep(
 				quickInputService,
 				localize('yuvadev.wizard.cloud.title', 'Configure Cloud Provider'),
-				localize('yuvadev.wizard.cloud.detail', 'Connect Anthropic, OpenAI, or DeepSeek for paid cloud execution.'),
+				accessMode === 'ollama_cloud_byok'
+					? localize('yuvadev.wizard.cloud.detail.byok', 'Connect your Ollama Cloud API key and model ID.')
+					: localize('yuvadev.wizard.cloud.detail.paid', 'Activate YuvaDev paid routing (no personal cloud key required).'),
 			);
 			if (shouldConfigureCloud) {
 				await commandService.executeCommand('yuvadev.configureProviderKey');
 			}
 		}
 
-		if (runtimeMode !== 'cloud') {
+		if (accessMode === 'local_unlimited') {
 			const shouldPullModel = await confirmWizardStep(
 				quickInputService,
 				localize('yuvadev.wizard.local.title', 'Prepare Local Model'),
@@ -681,6 +864,154 @@ registerAction2(class CheckYuvaDevAccountStatusAction extends Action2 {
 	}
 });
 
+registerAction2(class CheckYuvaDevUsageAndBudgetAction extends Action2 {
+	constructor() {
+		super({
+			id: 'yuvadev.checkUsageAndBudget',
+			title: localize2('yuvadev.checkUsageAndBudget', 'Check YuvaDev Usage and Budget'),
+			category: YUVADEV_CATEGORY,
+			f1: true,
+			precondition: ContextKeyExpr.not('isWeb'),
+		});
+	}
+
+	async run(accessor: ServicesAccessor): Promise<void> {
+		const requestService = accessor.get(IRequestService);
+		const configurationService = accessor.get(IConfigurationService);
+		const notificationService = accessor.get(INotificationService);
+		const secretStorageService = accessor.get(ISecretStorageService);
+
+		try {
+			const usage = await fetchYuvaDevUsageBudget(configurationService, requestService, secretStorageService);
+			if (usage.usage_policy === 'local_unlimited') {
+				notificationService.info(localize(
+					'yuvadev.usage.summary.localUnlimited',
+					'Local runtime ({0}) is active. Local LLM usage is unlimited on this device. Cloud snapshot for plan {1}: tokens {2}/{3}, loops {4}/{5}.',
+					providerLabel(usage.primary_provider),
+					usage.plan.toUpperCase(),
+					formatUsageValue(usage.usage.tokens),
+					formatUsageValue(usage.limits.tokens),
+					formatUsageValue(usage.usage.agent_loops),
+					formatUsageValue(usage.limits.agent_loops),
+				));
+			} else if (usage.usage_policy === 'provider_managed') {
+				notificationService.info(localize(
+					'yuvadev.usage.summary.providerManaged',
+					'{0} mode is active. This mode uses your personal provider limits (for example Ollama Cloud daily/weekly caps), not YuvaDev paid quotas.',
+					providerLabel(usage.primary_provider),
+				));
+			} else {
+				notificationService.info(localize(
+					'yuvadev.usage.summary',
+					'Plan {0}. Tokens {1}/{2} ({3}%). Loops {4}/{5} ({6}%). Build minutes {7}/{8} ({9}%). Active sessions: {10}.',
+					usage.plan.toUpperCase(),
+					formatUsageValue(usage.usage.tokens),
+					formatUsageValue(usage.limits.tokens),
+					formatUsagePercent(usage.percent_used.tokens),
+					formatUsageValue(usage.usage.agent_loops),
+					formatUsageValue(usage.limits.agent_loops),
+					formatUsagePercent(usage.percent_used.agent_loops),
+					formatUsageValue(usage.usage.build_minutes),
+					formatUsageValue(usage.limits.build_minutes),
+					formatUsagePercent(usage.percent_used.build_minutes),
+					formatUsageValue(usage.active_sessions),
+				));
+			}
+
+			if (usage.alerts.length > 0) {
+				notificationService.warn(localize(
+					'yuvadev.usage.alerts',
+					'Usage alerts: {0}',
+					usage.alerts.join(' '),
+				));
+			}
+		} catch (error) {
+			await clearAuthTokens(secretStorageService);
+			notificationService.warn(localize(
+				'yuvadev.usage.failed',
+				'Could not load YuvaDev usage and budget details. Sign in again to continue. ({0})',
+				error instanceof Error ? error.message : String(error),
+			));
+		}
+	}
+});
+
+registerAction2(class ShowYuvaDevUsageBreakdownAction extends Action2 {
+	constructor() {
+		super({
+			id: 'yuvadev.showUsageBreakdown',
+			title: localize2('yuvadev.showUsageBreakdown', 'Show YuvaDev Usage Breakdown'),
+			category: YUVADEV_CATEGORY,
+			f1: true,
+			precondition: ContextKeyExpr.not('isWeb'),
+		});
+	}
+
+	async run(accessor: ServicesAccessor): Promise<void> {
+		const quickInputService = accessor.get(IQuickInputService);
+		const requestService = accessor.get(IRequestService);
+		const configurationService = accessor.get(IConfigurationService);
+		const notificationService = accessor.get(INotificationService);
+		const secretStorageService = accessor.get(ISecretStorageService);
+
+		try {
+			const usage = await fetchYuvaDevUsageBudget(configurationService, requestService, secretStorageService);
+			await quickInputService.pick([
+				{
+					label: localize('yuvadev.usage.breakdown.mode', 'Runtime policy'),
+					description: usage.usage_policy === 'local_unlimited'
+						? localize('yuvadev.usage.breakdown.mode.localUnlimited', 'Local LLM usage is unlimited')
+						: usage.usage_policy === 'provider_managed'
+							? localize('yuvadev.usage.breakdown.mode.providerManaged', 'Provider-managed limits (BYOK mode)')
+							: localize('yuvadev.usage.breakdown.mode.cloudMetered', 'Cloud usage is metered by YuvaDev plan limits'),
+					detail: localize('yuvadev.usage.breakdown.modeProvider', 'Active provider: {0}', providerLabel(usage.primary_provider)),
+				},
+				{
+					label: localize('yuvadev.usage.breakdown.plan', 'Plan'),
+					description: usage.plan.toUpperCase(),
+					detail: localize('yuvadev.usage.breakdown.period', 'Period {0} to {1}', usage.period_start || 'n/a', usage.period_end || 'n/a'),
+				},
+				{
+					label: localize('yuvadev.usage.breakdown.tokens', 'Tokens'),
+					description: `${formatUsageValue(usage.usage.tokens)} / ${formatUsageValue(usage.limits.tokens)} (${formatUsagePercent(usage.percent_used.tokens)}%)`,
+					detail: localize('yuvadev.usage.breakdown.tokensRemaining', 'Remaining: {0}', formatUsageValue(usage.remaining.tokens)),
+				},
+				{
+					label: localize('yuvadev.usage.breakdown.loops', 'Agent loops'),
+					description: `${formatUsageValue(usage.usage.agent_loops)} / ${formatUsageValue(usage.limits.agent_loops)} (${formatUsagePercent(usage.percent_used.agent_loops)}%)`,
+					detail: localize('yuvadev.usage.breakdown.loopsRemaining', 'Remaining: {0}', formatUsageValue(usage.remaining.agent_loops)),
+				},
+				{
+					label: localize('yuvadev.usage.breakdown.minutes', 'Build minutes'),
+					description: `${formatUsageValue(usage.usage.build_minutes)} / ${formatUsageValue(usage.limits.build_minutes)} (${formatUsagePercent(usage.percent_used.build_minutes)}%)`,
+					detail: localize('yuvadev.usage.breakdown.minutesRemaining', 'Remaining: {0}', formatUsageValue(usage.remaining.build_minutes)),
+				},
+				{
+					label: localize('yuvadev.usage.breakdown.sessions', 'Agent sessions'),
+					description: localize('yuvadev.usage.breakdown.sessionsDescription', 'Completed: {0} | Active: {1}', formatUsageValue(usage.completed_sessions), formatUsageValue(usage.active_sessions)),
+					detail: localize('yuvadev.usage.breakdown.source', 'Source: {0}', usage.source),
+				},
+				{
+					label: localize('yuvadev.usage.breakdown.alerts', 'Alerts'),
+					description: usage.alerts.length > 0 ? localize('yuvadev.usage.breakdown.alertsCount', '{0} active', usage.alerts.length) : localize('yuvadev.usage.breakdown.alertsNone', 'None'),
+					detail: usage.alerts.length > 0 ? usage.alerts.join(' ') : localize('yuvadev.usage.breakdown.alertsClear', 'All usage signals are within configured limits.'),
+				},
+			], {
+				title: localize('yuvadev.usage.breakdown.title', 'YuvaDev Usage and Budget Breakdown'),
+				placeHolder: localize('yuvadev.usage.breakdown.placeholder', 'Snapshot of your current monthly usage and limits'),
+				ignoreFocusLost: true,
+			});
+		} catch (error) {
+			await clearAuthTokens(secretStorageService);
+			notificationService.warn(localize(
+				'yuvadev.usage.breakdown.failed',
+				'Could not load usage breakdown. Sign in again to continue. ({0})',
+				error instanceof Error ? error.message : String(error),
+			));
+		}
+	}
+});
+
 registerAction2(class SignOutYuvaDevAccountAction extends Action2 {
 	constructor() {
 		super({
@@ -717,35 +1048,28 @@ registerAction2(class ChooseYuvaDevRuntimeModeAction extends Action2 {
 		const configurationService = accessor.get(IConfigurationService);
 		const notificationService = accessor.get(INotificationService);
 
-		const currentMode = getRuntimeMode(configurationService);
-		const picked = await quickInputService.pick<ValueQuickPickItem<RuntimeMode>>([
+		const currentAccessMode = getAccessModeFromSettings(configurationService);
+		const picked = await quickInputService.pick<ValueQuickPickItem<AccessMode>>([
 			{
-				label: 'Auto',
-				description: 'Balanced default',
-				detail: 'Let YuvaDev choose the best available path from your configured providers.',
-				value: 'auto',
-				picked: currentMode === 'auto',
+				label: 'Local Unlimited',
+				description: 'Your own local LLM via Ollama',
+				detail: 'Use your own machine and model. YuvaDev does not enforce usage limits in this mode.',
+				value: 'local_unlimited',
+				picked: currentAccessMode === 'local_unlimited',
 			},
 			{
-				label: 'Local',
-				description: 'Free on-device',
-				detail: 'Prefer your local Ollama model and keep work on the machine when possible.',
-				value: 'local',
-				picked: currentMode === 'local',
+				label: 'Ollama Cloud BYOK',
+				description: 'Use your own Ollama Cloud API key',
+				detail: 'Enter your personal Ollama API key and model ID. Ollama Cloud limits apply from your own account.',
+				value: 'ollama_cloud_byok',
+				picked: currentAccessMode === 'ollama_cloud_byok',
 			},
 			{
-				label: 'Cloud',
-				description: 'Paid provider',
-				detail: 'Force YuvaDev to use your selected cloud provider for generation.',
-				value: 'cloud',
-				picked: currentMode === 'cloud',
-			},
-			{
-				label: 'Hybrid',
-				description: 'Best of both',
-				detail: 'Keep auto-routing available while still configuring local and cloud paths.',
-				value: 'hybrid',
-				picked: currentMode === 'hybrid',
+				label: 'YuvaDev Paid Models',
+				description: 'Managed paid routing',
+				detail: 'Use YuvaDev paid model routing with platform-managed limits and account entitlements.',
+				value: 'yuvadev_paid',
+				picked: currentAccessMode === 'yuvadev_paid',
 			},
 		], {
 			placeHolder: localize('yuvadev.runtimeMode.placeholder', 'Choose how YuvaDev should execute tasks'),
@@ -755,38 +1079,40 @@ registerAction2(class ChooseYuvaDevRuntimeModeAction extends Action2 {
 			return;
 		}
 
-		await configurationService.updateValue(YUVADEV_RUNTIME_MODE_SETTING, picked.value, ConfigurationTarget.APPLICATION);
+		if (picked.value === 'local_unlimited') {
+			await configurationService.updateValue(YUVADEV_RUNTIME_MODE_SETTING, 'local', ConfigurationTarget.APPLICATION);
+			await configurationService.updateValue(YUVADEV_CLOUD_PROVIDER_SETTING, 'auto', ConfigurationTarget.APPLICATION);
 
-		try {
-			if (picked.value === 'local') {
+			try {
 				await persistRuntimeSelection(accessor, { primary_provider: 'ollama' });
-			} else if (picked.value === 'cloud') {
-				let provider = getCloudProvider(configurationService);
-				if (provider === 'auto') {
-					provider = await promptForCloudProvider(quickInputService, provider) ?? 'auto';
-					if (provider !== 'auto') {
-						await configurationService.updateValue(YUVADEV_CLOUD_PROVIDER_SETTING, provider, ConfigurationTarget.APPLICATION);
-					}
-				}
-				if (provider !== 'auto') {
-					await persistRuntimeSelection(accessor, { primary_provider: provider });
-				}
-			} else {
-				await persistRuntimeSelection(accessor, { primary_provider: 'auto' });
+			} catch (error) {
+				notificationService.warn(localize(
+					'yuvadev.runtimeMode.backendWarning',
+					'Runtime mode was saved in the IDE, but the backend could not be updated yet: {0}',
+					error instanceof Error ? error.message : String(error),
+				));
 			}
-		} catch (error) {
-			notificationService.warn(localize(
-				'yuvadev.runtimeMode.backendWarning',
-				'Runtime mode was saved in the IDE, but the backend could not be updated yet: {0}',
-				error instanceof Error ? error.message : String(error),
+
+			notificationService.info(localize(
+				'yuvadev.runtimeMode.updated',
+				'YuvaDev mode set to {0}.',
+				picked.label,
 			));
+			return;
 		}
 
-		notificationService.info(localize(
-			'yuvadev.runtimeMode.updated',
-			'YuvaDev runtime mode set to {0}.',
-			picked.label,
-		));
+		if (picked.value === 'ollama_cloud_byok') {
+			const configured = await configureCloudProviderAccess(accessor, 'ollama_cloud');
+			if (!configured) {
+				notificationService.info(localize(
+					'yuvadev.runtimeMode.byok.cancelled',
+					'Ollama Cloud BYOK setup was cancelled. Runtime mode was not changed.',
+				));
+			}
+			return;
+		}
+
+		await configureCloudProviderAccess(accessor, 'yuvadev_paid');
 	}
 });
 
@@ -857,10 +1183,17 @@ registerAction2(class ChooseYuvaDevCloudProviderAction extends Action2 {
 		}
 
 		await configurationService.updateValue(YUVADEV_CLOUD_PROVIDER_SETTING, provider, ConfigurationTarget.APPLICATION);
+		if (provider === 'ollama_cloud' || provider === 'yuvadev_paid') {
+			await configurationService.updateValue(YUVADEV_RUNTIME_MODE_SETTING, 'cloud', ConfigurationTarget.APPLICATION);
+		}
 
 		if (getRuntimeMode(configurationService) === 'cloud') {
 			try {
-				await persistRuntimeSelection(accessor, { primary_provider: provider });
+				const payload: ProviderUpdatePayload = { primary_provider: provider };
+				if (provider === 'ollama_cloud') {
+					payload.ollama_cloud_model = getOllamaCloudModel(configurationService);
+				}
+				await persistRuntimeSelection(accessor, payload);
 			} catch (error) {
 				notificationService.warn(localize(
 					'yuvadev.cloudProvider.backendWarning',
@@ -870,11 +1203,19 @@ registerAction2(class ChooseYuvaDevCloudProviderAction extends Action2 {
 			}
 		}
 
-		notificationService.info(localize(
-			'yuvadev.cloudProvider.updated',
-			'YuvaDev cloud provider set to {0}.',
-			providerLabel(provider),
-		));
+		if (provider === 'ollama_cloud') {
+			notificationService.info(localize(
+				'yuvadev.cloudProvider.updated.byok',
+				'YuvaDev cloud provider set to {0}. Run "Add YuvaDev Cloud Provider Key" to enter your Ollama key and model.',
+				providerLabel(provider),
+			));
+		} else {
+			notificationService.info(localize(
+				'yuvadev.cloudProvider.updated',
+				'YuvaDev cloud provider set to {0}.',
+				providerLabel(provider),
+			));
+		}
 	}
 });
 
@@ -942,7 +1283,6 @@ registerAction2(class ConfigureYuvaDevProviderKeyAction extends Action2 {
 	async run(accessor: ServicesAccessor): Promise<void> {
 		const quickInputService = accessor.get(IQuickInputService);
 		const configurationService = accessor.get(IConfigurationService);
-		const notificationService = accessor.get(INotificationService);
 		const currentProvider = getCloudProvider(configurationService);
 		const provider = await promptForCloudProvider(quickInputService, currentProvider);
 
@@ -950,39 +1290,11 @@ registerAction2(class ConfigureYuvaDevProviderKeyAction extends Action2 {
 			return;
 		}
 
-		const apiKey = await quickInputService.input({
-			title: localize('yuvadev.providerKey.title', 'Add Cloud Provider Key'),
-			prompt: localize('yuvadev.providerKey.prompt', 'Paste your {0} API key. The value will be stored by the YuvaDev backend.', providerLabel(provider)),
-			placeHolder: localize('yuvadev.providerKey.placeholder', 'sk-...'),
-			password: true,
-			validateInput: async value => value.trim().length > 0 ? undefined : localize('yuvadev.providerKey.required', 'API key is required.'),
-		});
-
-		if (!apiKey) {
+		if (!isConfigurableCloudProvider(provider)) {
 			return;
 		}
 
-		await configurationService.updateValue(YUVADEV_CLOUD_PROVIDER_SETTING, provider, ConfigurationTarget.APPLICATION);
-
-		const payload: ProviderUpdatePayload = { [provider]: apiKey.trim() };
-		if (getRuntimeMode(configurationService) === 'cloud') {
-			payload.primary_provider = provider;
-		}
-
-		try {
-			await persistRuntimeSelection(accessor, payload);
-			notificationService.info(localize(
-				'yuvadev.providerKey.saved',
-				'{0} key saved. YuvaDev can now use that cloud provider.',
-				providerLabel(provider),
-			));
-		} catch (error) {
-			notificationService.error(localize(
-				'yuvadev.providerKey.failed',
-				'Could not save the provider key: {0}',
-				error instanceof Error ? error.message : String(error),
-			));
-		}
+		await configureCloudProviderAccess(accessor, provider);
 	}
 });
 
