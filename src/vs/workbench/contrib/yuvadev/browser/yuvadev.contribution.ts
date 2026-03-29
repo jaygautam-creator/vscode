@@ -7,6 +7,7 @@ import { VSBuffer } from '../../../../base/common/buffer.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { Codicon } from '../../../../base/common/codicons.js';
 import { isWeb } from '../../../../base/common/platform.js';
+import { URI } from '../../../../base/common/uri.js';
 import { listenStream } from '../../../../base/common/stream.js';
 import { FileAccess } from '../../../../base/common/network.js';
 import { localize, localize2 } from '../../../../nls.js';
@@ -17,6 +18,7 @@ import { ConfigurationScope, Extensions as ConfigurationExtensions, IConfigurati
 import { ContextKeyExpr } from '../../../../platform/contextkey/common/contextkey.js';
 import { ServicesAccessor } from '../../../../platform/instantiation/common/instantiation.js';
 import { INotificationService } from '../../../../platform/notification/common/notification.js';
+import { IOpenerService } from '../../../../platform/opener/common/opener.js';
 import { IProgressService, ProgressLocation } from '../../../../platform/progress/common/progress.js';
 import product from '../../../../platform/product/common/product.js';
 import { IQuickInputService, IQuickPickItem } from '../../../../platform/quickinput/common/quickInput.js';
@@ -24,6 +26,7 @@ import { Registry } from '../../../../platform/registry/common/platform.js';
 import { asJson, IRequestService } from '../../../../platform/request/common/request.js';
 import { ISecretStorageService } from '../../../../platform/secrets/common/secrets.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
+import { ITelemetryService } from '../../../../platform/telemetry/common/telemetry.js';
 import { ICommandService } from '../../../../platform/commands/common/commands.js';
 import { registerWorkbenchContribution2, WorkbenchPhase } from '../../../common/contributions.js';
 import { IWalkthroughLoose, IWalkthroughsService } from '../../welcomeGettingStarted/browser/gettingStartedService.js';
@@ -44,6 +47,8 @@ const YUVADEV_AUTH_ACCESS_TOKEN_SECRET = 'yuvadev.auth.accessToken';
 const YUVADEV_AUTH_REFRESH_TOKEN_SECRET = 'yuvadev.auth.refreshToken';
 const YUVADEV_AUTH_EMAIL_STORAGE_KEY = 'yuvadev.auth.email';
 const YUVADEV_DEFAULT_API_URL = 'http://127.0.0.1:8124';
+const YUVADEV_OAUTH_POLL_INTERVAL_MS = 3000;
+const YUVADEV_OAUTH_POLL_MAX_ATTEMPTS = 40;
 
 type RuntimeMode = 'auto' | 'local' | 'cloud' | 'hybrid';
 type CloudProvider = 'auto' | 'ollama_cloud' | 'yuvadev_paid' | 'anthropic' | 'openai' | 'deepseek';
@@ -102,10 +107,24 @@ type ProviderUpdatePayload = {
 	ollama_cloud_model?: string;
 };
 
-interface AuthTokenResponse {
-	access_token: string;
-	refresh_token: string;
-	token_type: string;
+interface PasswordlessStartResponse {
+	status: string;
+	message: string;
+	device_id?: string;
+}
+
+interface PasswordlessVerifyResponse {
+	status: string;
+	user_id: string;
+	session_handle: string;
+}
+
+interface AuthDeviceSessionInfo {
+	session_handle: string;
+	device_name: string | null;
+	created_at: string | null;
+	last_seen_at: string | null;
+	is_current: boolean;
 }
 
 interface AuthRefreshResponse {
@@ -504,12 +523,6 @@ async function configureCloudProviderAccess(
 	}
 }
 
-function formEncode(data: Record<string, string>): string {
-	return Object.entries(data)
-		.map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
-		.join('&');
-}
-
 function formatUsageValue(value: number | undefined): string {
 	if (typeof value !== 'number' || !Number.isFinite(value)) {
 		return '0';
@@ -522,6 +535,261 @@ function formatUsagePercent(value: number | undefined): string {
 		return '0';
 	}
 	return value.toFixed(2);
+}
+
+/*
+ * Task 1.5 Manual Verification:
+ * 1. Run "Sign In to YuvaDev Account", choose Email OTP, and verify no password prompt appears.
+ * 2. Run "Sign In with Google OAuth", complete browser flow, and confirm polling resolves within 2 minutes.
+ * 3. Run "View YuvaDev Device Sessions", confirm active sessions are listed, and revoke a non-current session.
+ * 4. Run "Sign Out from YuvaDev Account", confirm logout-all is attempted and local credentials are cleared.
+ */
+function resolveDeviceId(
+	storageService: IStorageService,
+	telemetryService: ITelemetryService,
+	backendDeviceId?: string,
+): string {
+	const backend = backendDeviceId?.trim();
+	if (backend) {
+		return backend;
+	}
+	const telemetryMachineId = telemetryService.machineId?.trim();
+	if (telemetryMachineId) {
+		return telemetryMachineId;
+	}
+	const storedMachineId = storageService.get('storage.serviceMachineId', StorageScope.APPLICATION, '').trim();
+	return storedMachineId || 'yuvadev-desktop';
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function formatSessionTimestamp(value: string | null | undefined): string {
+	return value && value.trim() ? value : localize('yuvadev.auth.sessions.timestamp.unknown', 'unknown');
+}
+
+async function startPasswordlessOtp(
+	configurationService: IConfigurationService,
+	requestService: IRequestService,
+	email: string,
+): Promise<PasswordlessStartResponse> {
+	return requestJson<PasswordlessStartResponse>(
+		requestService,
+		`${getApiUrl(configurationService)}/api/auth/passwordless/start`,
+		{ type: 'POST', data: JSON.stringify({ email }) },
+	);
+}
+
+async function verifyPasswordlessOtp(
+	configurationService: IConfigurationService,
+	requestService: IRequestService,
+	email: string,
+	code: string,
+	deviceId: string,
+): Promise<PasswordlessVerifyResponse> {
+	return requestJson<PasswordlessVerifyResponse>(
+		requestService,
+		`${getApiUrl(configurationService)}/api/auth/passwordless/verify`,
+		{
+			type: 'POST',
+			data: JSON.stringify({
+				email,
+				code,
+				device_id: deviceId,
+			}),
+		},
+	);
+}
+
+async function listDeviceSessions(
+	configurationService: IConfigurationService,
+	requestService: IRequestService,
+): Promise<AuthDeviceSessionInfo[]> {
+	return requestJson<AuthDeviceSessionInfo[]>(
+		requestService,
+		`${getApiUrl(configurationService)}/api/auth/sessions`,
+	);
+}
+
+async function revokeDeviceSession(
+	configurationService: IConfigurationService,
+	requestService: IRequestService,
+	sessionHandle: string,
+): Promise<void> {
+	await requestJson<{ status: string }>(
+		requestService,
+		`${getApiUrl(configurationService)}/api/auth/sessions/${encodeURIComponent(sessionHandle)}/revoke`,
+		{ type: 'POST' },
+	);
+}
+
+async function logoutAllDeviceSessions(
+	configurationService: IConfigurationService,
+	requestService: IRequestService,
+): Promise<void> {
+	await requestJson<{ status: string }>(
+		requestService,
+		`${getApiUrl(configurationService)}/api/auth/logout-all`,
+		{ type: 'POST' },
+	);
+}
+
+async function pollForOAuthProfile(
+	configurationService: IConfigurationService,
+	requestService: IRequestService,
+	progressService: IProgressService,
+): Promise<AuthUserProfile> {
+	let cancelled = false;
+	let profile: AuthUserProfile | undefined;
+	const cancelledMessage = localize('yuvadev.auth.oauth.cancelled', 'Google OAuth sign-in was cancelled.');
+	const timeoutMessage = localize(
+		'yuvadev.auth.oauth.timeout',
+		'Google OAuth sign-in did not complete within {0} seconds.',
+		Math.floor((YUVADEV_OAUTH_POLL_INTERVAL_MS * YUVADEV_OAUTH_POLL_MAX_ATTEMPTS) / 1000),
+	);
+
+	await progressService.withProgress<void>({
+		location: ProgressLocation.Notification,
+		title: localize('yuvadev.auth.oauth.polling', 'Waiting for Google OAuth sign-in'),
+		cancellable: true,
+	}, async progress => {
+		for (let attempt = 1; attempt <= YUVADEV_OAUTH_POLL_MAX_ATTEMPTS; attempt++) {
+			if (cancelled) {
+				throw new Error(cancelledMessage);
+			}
+
+			progress.report({
+				message: localize(
+					'yuvadev.auth.oauth.polling.attempt',
+					'Checking sign-in status ({0}/{1})...',
+					attempt,
+					YUVADEV_OAUTH_POLL_MAX_ATTEMPTS,
+				),
+			});
+
+			try {
+				profile = await requestJson<AuthUserProfile>(
+					requestService,
+					`${getApiUrl(configurationService)}/api/auth/me`,
+				);
+				return;
+			} catch {
+				// Continue polling while the browser flow completes.
+			}
+
+			if (attempt < YUVADEV_OAUTH_POLL_MAX_ATTEMPTS) {
+				await sleep(YUVADEV_OAUTH_POLL_INTERVAL_MS);
+			}
+		}
+	}, () => {
+		cancelled = true;
+	});
+
+	if (profile) {
+		return profile;
+	}
+	if (cancelled) {
+		throw new Error(cancelledMessage);
+	}
+	throw new Error(timeoutMessage);
+}
+
+async function runOtpSignIn(accessor: ServicesAccessor): Promise<void> {
+	const quickInputService = accessor.get(IQuickInputService);
+	const requestService = accessor.get(IRequestService);
+	const configurationService = accessor.get(IConfigurationService);
+	const notificationService = accessor.get(INotificationService);
+	const progressService = accessor.get(IProgressService);
+	const storageService = accessor.get(IStorageService);
+	const secretStorageService = accessor.get(ISecretStorageService);
+	const telemetryService = accessor.get(ITelemetryService);
+
+	const rememberedEmail = storageService.get(YUVADEV_AUTH_EMAIL_STORAGE_KEY, StorageScope.APPLICATION, '');
+	const email = await quickInputService.input({
+		title: localize('yuvadev.auth.email.title', 'YuvaDev Account Email'),
+		prompt: localize('yuvadev.auth.email.prompt', 'Enter your YuvaDev account email address.'),
+		value: rememberedEmail,
+		placeHolder: localize('yuvadev.auth.email.placeholder', 'you@company.com'),
+		validateInput: async value => value.includes('@') ? undefined : localize('yuvadev.auth.email.invalid', 'Enter a valid email address.'),
+	});
+	if (!email) {
+		return;
+	}
+
+	try {
+		const startResponse = await progressService.withProgress<PasswordlessStartResponse>({
+			location: ProgressLocation.Notification,
+			title: localize('yuvadev.auth.otp.starting', 'Sending one-time code'),
+			cancellable: false,
+		}, async () => startPasswordlessOtp(configurationService, requestService, email.trim()));
+
+		const code = await quickInputService.input({
+			title: localize('yuvadev.auth.otp.code.title', 'Enter OTP Code'),
+			prompt: localize('yuvadev.auth.otp.code.prompt', 'Enter the one-time code sent to your email.'),
+			placeHolder: localize('yuvadev.auth.otp.code.placeholder', '123456'),
+			validateInput: async value => value.trim().length > 0 ? undefined : localize('yuvadev.auth.otp.code.required', 'OTP code is required.'),
+		});
+		if (!code) {
+			return;
+		}
+
+		const deviceId = resolveDeviceId(storageService, telemetryService, startResponse.device_id);
+		const verifyResult = await progressService.withProgress<PasswordlessVerifyResponse>({
+			location: ProgressLocation.Notification,
+			title: localize('yuvadev.auth.otp.verifying', 'Verifying one-time code'),
+			cancellable: false,
+		}, async () => verifyPasswordlessOtp(configurationService, requestService, email.trim(), code.trim(), deviceId));
+
+		await clearAuthTokens(secretStorageService);
+		storageService.store(YUVADEV_AUTH_EMAIL_STORAGE_KEY, email.trim(), StorageScope.APPLICATION, StorageTarget.USER);
+
+		notificationService.info(localize(
+			'yuvadev.auth.otp.success',
+			'Signed in with OTP as {0}. Session {1} is active on this device.',
+			email.trim(),
+			verifyResult.session_handle,
+		));
+	} catch (error) {
+		await clearAuthTokens(secretStorageService);
+		notificationService.error(localize(
+			'yuvadev.auth.otp.failed',
+			'OTP sign-in failed: {0}',
+			error instanceof Error ? error.message : String(error),
+		));
+	}
+}
+
+async function runGoogleOAuthSignIn(accessor: ServicesAccessor): Promise<void> {
+	const requestService = accessor.get(IRequestService);
+	const configurationService = accessor.get(IConfigurationService);
+	const notificationService = accessor.get(INotificationService);
+	const progressService = accessor.get(IProgressService);
+	const storageService = accessor.get(IStorageService);
+	const secretStorageService = accessor.get(ISecretStorageService);
+	const openerService = accessor.get(IOpenerService);
+
+	try {
+		const startUrl = `${getApiUrl(configurationService)}/api/auth/oauth/google/start`;
+		await openerService.open(URI.parse(startUrl));
+
+		const profile = await pollForOAuthProfile(configurationService, requestService, progressService);
+
+		await clearAuthTokens(secretStorageService);
+		storageService.store(YUVADEV_AUTH_EMAIL_STORAGE_KEY, profile.email, StorageScope.APPLICATION, StorageTarget.USER);
+
+		notificationService.info(localize(
+			'yuvadev.auth.oauth.success',
+			'Signed in with Google OAuth as {0}.',
+			profile.email,
+		));
+	} catch (error) {
+		notificationService.error(localize(
+			'yuvadev.auth.oauth.failed',
+			'Google OAuth sign-in failed: {0}',
+			error instanceof Error ? error.message : String(error),
+		));
+	}
 }
 
 async function readAuthTokens(secretStorageService: ISecretStorageService): Promise<{ accessToken?: string; refreshToken?: string }> {
@@ -600,12 +868,19 @@ async function fetchYuvaDevProfile(
 	requestService: IRequestService,
 	secretStorageService: ISecretStorageService,
 ): Promise<AuthUserProfile> {
-	return requestWithYuvaDevAuth<AuthUserProfile>(
-		configurationService,
-		requestService,
-		secretStorageService,
-		'/api/auth/me',
-	);
+	try {
+		return await requestJson<AuthUserProfile>(
+			requestService,
+			`${getApiUrl(configurationService)}/api/auth/me`,
+		);
+	} catch {
+		return requestWithYuvaDevAuth<AuthUserProfile>(
+			configurationService,
+			requestService,
+			secretStorageService,
+			'/api/auth/me',
+		);
+	}
 }
 
 async function fetchYuvaDevUsageBudget(
@@ -756,76 +1031,49 @@ registerAction2(class SignInYuvaDevAccountAction extends Action2 {
 
 	async run(accessor: ServicesAccessor): Promise<void> {
 		const quickInputService = accessor.get(IQuickInputService);
-		const requestService = accessor.get(IRequestService);
-		const configurationService = accessor.get(IConfigurationService);
-		const notificationService = accessor.get(INotificationService);
-		const progressService = accessor.get(IProgressService);
-		const storageService = accessor.get(IStorageService);
-		const secretStorageService = accessor.get(ISecretStorageService);
-
-		const rememberedEmail = storageService.get(YUVADEV_AUTH_EMAIL_STORAGE_KEY, StorageScope.APPLICATION, '');
-		const email = await quickInputService.input({
-			title: localize('yuvadev.auth.email.title', 'YuvaDev Account Email'),
-			prompt: localize('yuvadev.auth.email.prompt', 'Enter your YuvaDev account email address.'),
-			value: rememberedEmail,
-			placeHolder: localize('yuvadev.auth.email.placeholder', 'you@company.com'),
-			validateInput: async value => value.includes('@') ? undefined : localize('yuvadev.auth.email.invalid', 'Enter a valid email address.'),
+		const picked = await quickInputService.pick<ValueQuickPickItem<'otp' | 'google'>>([
+			{
+				label: localize('yuvadev.auth.method.otp.label', 'Email OTP'),
+				description: localize('yuvadev.auth.method.otp.description', 'Receive a one-time code by email'),
+				value: 'otp',
+			},
+			{
+				label: localize('yuvadev.auth.method.google.label', 'Google OAuth'),
+				description: localize('yuvadev.auth.method.google.description', 'Continue in your browser with Google'),
+				value: 'google',
+			},
+		], {
+			title: localize('yuvadev.auth.method.title', 'Choose sign-in method'),
+			placeHolder: localize('yuvadev.auth.method.placeholder', 'Select Email OTP or Google OAuth'),
+			ignoreFocusLost: true,
 		});
 
-		if (!email) {
+		if (!picked) {
 			return;
 		}
 
-		const password = await quickInputService.input({
-			title: localize('yuvadev.auth.password.title', 'YuvaDev Account Password'),
-			prompt: localize('yuvadev.auth.password.prompt', 'Enter your account password.'),
-			password: true,
-			validateInput: async value => value.trim().length > 0 ? undefined : localize('yuvadev.auth.password.required', 'Password is required.'),
-		});
-
-		if (!password) {
+		if (picked.value === 'otp') {
+			await runOtpSignIn(accessor);
 			return;
 		}
 
-		try {
-			const tokenResponse = await progressService.withProgress<AuthTokenResponse>({
-				location: ProgressLocation.Notification,
-				title: localize('yuvadev.auth.signingIn', 'Signing in to YuvaDev account'),
-				cancellable: false,
-			}, async () => requestJson<AuthTokenResponse>(
-				requestService,
-				`${getApiUrl(configurationService)}/api/auth/login`,
-				{
-					type: 'POST',
-					data: formEncode({
-						username: email.trim(),
-						password: password,
-						grant_type: 'password',
-					}),
-					headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-				},
-			));
+		await runGoogleOAuthSignIn(accessor);
+	}
+});
 
-			await Promise.all([
-				secretStorageService.set(YUVADEV_AUTH_ACCESS_TOKEN_SECRET, tokenResponse.access_token),
-				secretStorageService.set(YUVADEV_AUTH_REFRESH_TOKEN_SECRET, tokenResponse.refresh_token),
-			]);
-			storageService.store(YUVADEV_AUTH_EMAIL_STORAGE_KEY, email.trim(), StorageScope.APPLICATION, StorageTarget.USER);
+registerAction2(class SignInYuvaDevGoogleOAuthAction extends Action2 {
+	constructor() {
+		super({
+			id: 'yuvadev.signInWithGoogleOAuth',
+			title: localize2('yuvadev.signInWithGoogleOAuth', 'Sign In with Google OAuth'),
+			category: YUVADEV_CATEGORY,
+			f1: true,
+			precondition: ContextKeyExpr.not('isWeb'),
+		});
+	}
 
-			const profile = await fetchYuvaDevProfile(configurationService, requestService, secretStorageService);
-			notificationService.info(localize(
-				'yuvadev.auth.login.success',
-				'Signed in as {0}. Account is active and ready for cloud-enabled YuvaDev sessions.',
-				profile.email,
-			));
-		} catch (error) {
-			await clearAuthTokens(secretStorageService);
-			notificationService.error(localize(
-				'yuvadev.auth.login.failed',
-				'YuvaDev sign-in failed: {0}',
-				error instanceof Error ? error.message : String(error),
-			));
-		}
+	async run(accessor: ServicesAccessor): Promise<void> {
+		await runGoogleOAuthSignIn(accessor);
 	}
 });
 
@@ -1025,11 +1273,130 @@ registerAction2(class SignOutYuvaDevAccountAction extends Action2 {
 	}
 
 	async run(accessor: ServicesAccessor): Promise<void> {
+		const requestService = accessor.get(IRequestService);
+		const configurationService = accessor.get(IConfigurationService);
 		const secretStorageService = accessor.get(ISecretStorageService);
 		const notificationService = accessor.get(INotificationService);
+		let revokeError: string | undefined;
+
+		try {
+			await logoutAllDeviceSessions(configurationService, requestService);
+		} catch (error) {
+			revokeError = error instanceof Error ? error.message : String(error);
+		}
 
 		await clearAuthTokens(secretStorageService);
-		notificationService.info(localize('yuvadev.auth.signOut.complete', 'Signed out from YuvaDev account on this device.'));
+
+		if (revokeError) {
+			notificationService.warn(localize(
+				'yuvadev.auth.signOut.partial',
+				'Local credentials were cleared, but backend session revoke failed: {0}',
+				revokeError,
+			));
+			return;
+		}
+
+		notificationService.info(localize(
+			'yuvadev.auth.signOut.complete',
+			'Signed out from YuvaDev account on this device and requested server-side session revoke.',
+		));
+	}
+});
+
+registerAction2(class ViewYuvaDevSessionsAction extends Action2 {
+	constructor() {
+		super({
+			id: 'yuvadev.viewSessions',
+			title: localize2('yuvadev.viewSessions', 'View YuvaDev Device Sessions'),
+			category: YUVADEV_CATEGORY,
+			f1: true,
+			precondition: ContextKeyExpr.not('isWeb'),
+		});
+	}
+
+	async run(accessor: ServicesAccessor): Promise<void> {
+		const quickInputService = accessor.get(IQuickInputService);
+		const requestService = accessor.get(IRequestService);
+		const configurationService = accessor.get(IConfigurationService);
+		const notificationService = accessor.get(INotificationService);
+
+		try {
+			const sessions = await listDeviceSessions(configurationService, requestService);
+			if (sessions.length === 0) {
+				notificationService.info(localize('yuvadev.auth.sessions.empty', 'No active YuvaDev sessions were found.'));
+				return;
+			}
+
+			interface SessionPickItem extends IQuickPickItem {
+				sessionHandle: string;
+				isCurrent: boolean;
+			}
+
+			const picked = await quickInputService.pick<SessionPickItem>(
+				sessions.map(session => ({
+					label: session.is_current
+						? localize('yuvadev.auth.sessions.currentLabel', '$(check) {0}', session.device_name || 'Current device')
+						: (session.device_name || localize('yuvadev.auth.sessions.unknownDevice', 'Unknown device')),
+					description: session.is_current
+						? localize('yuvadev.auth.sessions.currentDescription', 'Current session')
+						: localize('yuvadev.auth.sessions.remoteDescription', 'Revocable session'),
+					detail: localize(
+						'yuvadev.auth.sessions.detail',
+						'Created: {0} | Last seen: {1}',
+						formatSessionTimestamp(session.created_at),
+						formatSessionTimestamp(session.last_seen_at),
+					),
+					sessionHandle: session.session_handle,
+					isCurrent: session.is_current,
+				})),
+				{
+					title: localize('yuvadev.auth.sessions.title', 'Active YuvaDev Device Sessions'),
+					placeHolder: localize('yuvadev.auth.sessions.placeholder', 'Select a session to view or revoke'),
+					ignoreFocusLost: true,
+				},
+			);
+
+			if (!picked) {
+				return;
+			}
+
+			if (picked.isCurrent) {
+				notificationService.info(localize('yuvadev.auth.sessions.currentSelected', 'This is your current active session.'));
+				return;
+			}
+
+			const confirm = await quickInputService.pick<ValueQuickPickItem<'revoke' | 'cancel'>>([
+				{
+					label: localize('yuvadev.auth.sessions.revoke.confirm', 'Revoke selected session'),
+					value: 'revoke',
+				},
+				{
+					label: localize('yuvadev.auth.sessions.revoke.cancel', 'Cancel'),
+					value: 'cancel',
+				},
+			], {
+				title: localize('yuvadev.auth.sessions.revoke.title', 'Revoke device session'),
+				placeHolder: localize('yuvadev.auth.sessions.revoke.placeholder', 'Confirm revocation'),
+				ignoreFocusLost: true,
+			});
+
+			if (!confirm || confirm.value !== 'revoke') {
+				return;
+			}
+
+			await revokeDeviceSession(configurationService, requestService, picked.sessionHandle);
+			notificationService.info(localize(
+				'yuvadev.auth.sessions.revoke.success',
+				'Session revoked: {0}',
+				picked.sessionHandle,
+			));
+		} catch (error) {
+			notificationService.warn(localize(
+				'yuvadev.auth.sessions.failed',
+				'Could not load or modify device sessions: {0}',
+				error instanceof Error ? error.message : String(error),
+			));
+		}
 	}
 });
 
