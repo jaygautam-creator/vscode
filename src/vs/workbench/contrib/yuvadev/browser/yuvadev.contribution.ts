@@ -43,6 +43,7 @@ const YUVADEV_BACKEND_AUTOSTART_SETTING = 'yuvadev.backend.autoStart';
 const YUVADEV_AUTH_ACCESS_TOKEN_SECRET = 'yuvadev.auth.accessToken';
 const YUVADEV_AUTH_REFRESH_TOKEN_SECRET = 'yuvadev.auth.refreshToken';
 const YUVADEV_AUTH_EMAIL_STORAGE_KEY = 'yuvadev.auth.email';
+const YUVADEV_DEFAULT_API_URL = 'http://127.0.0.1:8124';
 
 type RuntimeMode = 'auto' | 'local' | 'cloud' | 'hybrid';
 type CloudProvider = 'auto' | 'ollama_cloud' | 'yuvadev_paid' | 'anthropic' | 'openai' | 'deepseek';
@@ -158,7 +159,7 @@ configurationRegistry.registerConfiguration({
 	properties: {
 		[YUVADEV_API_URL_SETTING]: {
 			type: 'string',
-			default: 'http://127.0.0.1:8000',
+			default: YUVADEV_DEFAULT_API_URL,
 			scope: ConfigurationScope.APPLICATION_MACHINE,
 			description: localize('yuvadev.configuration.apiUrl', 'Backend URL used by the native YuvaDev IDE experience.'),
 		},
@@ -212,7 +213,7 @@ configurationRegistry.registerConfiguration({
 
 function getApiUrl(configurationService: IConfigurationService): string {
 	const configured = configurationService.getValue<string>(YUVADEV_API_URL_SETTING)?.trim();
-	return (configured && configured.length > 0 ? configured : 'http://127.0.0.1:8000').replace(/\/+$/, '');
+	return (configured && configured.length > 0 ? configured : YUVADEV_DEFAULT_API_URL).replace(/\/+$/, '');
 }
 
 function getRuntimeMode(configurationService: IConfigurationService): RuntimeMode {
