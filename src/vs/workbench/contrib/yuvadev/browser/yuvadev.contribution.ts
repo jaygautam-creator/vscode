@@ -539,7 +539,7 @@ function formatUsagePercent(value: number | undefined): string {
 
 /*
  * Task 1.5 Manual Verification:
- * 1. Run "Sign In to YuvaDev Account", choose Email OTP, and verify no password prompt appears.
+ * 1. Run "Sign In to YuvaDev Account", choose Email OTP, and verify the new OTP prompt appears instead of the old credential prompt.
  * 2. Run "Sign In with Google OAuth", complete browser flow, and confirm polling resolves within 2 minutes.
  * 3. Run "View YuvaDev Device Sessions", confirm active sessions are listed, and revoke a non-current session.
  * 4. Run "Sign Out from YuvaDev Account", confirm logout-all is attempted and local credentials are cleared.
