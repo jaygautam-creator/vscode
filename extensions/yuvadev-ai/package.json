@@ -1,0 +1,267 @@
+{
+    "name": "yuvadev-ai",
+    "displayName": "YuvaDev AI",
+    "description": "Autonomous AI Engineering IDE",
+    "version": "2.0.0-rc7",
+    "publisher": "yuvadev",
+    "license": "MIT",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/yuvadev/yuvadev-platform.git"
+    },
+    "engines": {
+        "vscode": "^1.80.0"
+    },
+    "categories": [
+        "Machine Learning",
+        "Other"
+    ],
+    "main": "./out/extension.js",
+    "activationEvents": [
+        "*"
+    ],
+    "contributes": {
+        "commands": [
+            {
+                "command": "yuvadev-ai.openSettings",
+                "title": "YuvaDev: Open Settings",
+                "icon": "$(settings-gear)"
+            },
+            {
+                "command": "yuvadev-ai.cmdK",
+                "title": "YuvaDev: Action Palette",
+                "key": "cmd+k"
+            },
+            {
+                "command": "yuvadev-ai.toggleChat",
+                "title": "YuvaDev: Toggle Chat"
+            },
+            {
+                "command": "yuvadev-ai.askAI",
+                "title": "Ask AI",
+                "icon": "$(comment-discussion)"
+            },
+            {
+                "command": "yuvadev-ai.refactor",
+                "title": "Refactor Code",
+                "icon": "$(wand)"
+            },
+            {
+                "command": "yuvadev-ai.generateApp",
+                "title": "Generate App",
+                "icon": "$(rocket)"
+            },
+            {
+                "command": "yuvadev-ai.fixErrors",
+                "title": "Fix Errors",
+                "icon": "$(bug)"
+            },
+            {
+                "command": "yuvadev-ai.addTests",
+                "title": "Add Tests",
+                "icon": "$(beaker)"
+            },
+            {
+                "command": "yuvadev-ai.explainCode",
+                "title": "Explain Code",
+                "icon": "$(info)"
+            },
+            {
+                "command": "yuvadev-ai.startBackend",
+                "title": "YuvaDev: Start Backend Server",
+                "icon": "$(play)"
+            },
+            {
+                "command": "yuvadev-ai.openWorkspace",
+                "title": "YuvaDev: Open AI Workspace",
+                "icon": "$(layout-panel-right)"
+            },
+            {
+                "command": "yuvadev-ai.runAgentTask",
+                "title": "YuvaDev: Run Agent Task",
+                "icon": "$(robot)"
+            },
+            {
+                "command": "yuvadev-ai.stopBackend",
+                "title": "YuvaDev: Stop Backend Server",
+                "icon": "$(stop)"
+            },
+            {
+                "command": "yuvadev.openSettings",
+                "title": "YuvaDev: Open Settings"
+            },
+            {
+                "command": "yuvadev.triggerAgent",
+                "title": "YuvaDev: Trigger Agent",
+                "icon": "$(rocket)"
+            },
+            {
+                "command": "yuvadev.approveAction",
+                "title": "YuvaDev: Approve Pending Action",
+                "icon": "$(check)"
+            },
+            {
+                "command": "yuvadev.rejectAction",
+                "title": "YuvaDev: Reject Pending Action",
+                "icon": "$(close)"
+            },
+            {
+                "command": "yuvadev.stopAgent",
+                "title": "YuvaDev: Stop Agent",
+                "icon": "$(debug-stop)"
+            },
+            {
+                "command": "yuvadev.showOnboarding",
+                "title": "YuvaDev: Show Onboarding"
+            },
+            {
+                "command": "yuvadev.restart",
+                "title": "YuvaDev: Restart"
+            }
+        ],
+        "keybindings": [
+            {
+                "command": "yuvadev-ai.openSettings",
+                "key": "ctrl+,",
+                "mac": "cmd+,"
+            },
+            {
+                "command": "yuvadev-ai.toggleChat",
+                "key": "cmd+shift+y",
+                "mac": "cmd+shift+y",
+                "when": "true"
+            },
+            {
+                "command": "yuvadev.triggerAgent",
+                "key": "ctrl+shift+a",
+                "mac": "cmd+shift+a"
+            },
+            {
+                "command": "yuvadev.approveAction",
+                "key": "ctrl+enter",
+                "mac": "cmd+enter",
+                "when": "yuvadev.pendingApproval"
+            },
+            {
+                "command": "yuvadev.rejectAction",
+                "key": "ctrl+backspace",
+                "mac": "cmd+backspace",
+                "when": "yuvadev.pendingApproval"
+            },
+            {
+                "command": "yuvadev.stopAgent",
+                "key": "ctrl+.",
+                "mac": "cmd+.",
+                "when": "yuvadev.agentRunning"
+            },
+            {
+                "command": "yuvadev.showOnboarding",
+                "key": "",
+                "mac": ""
+            }
+        ],
+        "menus": {
+            "editor/title": [
+                {
+                    "command": "yuvadev-ai.askAI",
+                    "group": "navigation@1"
+                },
+                {
+                    "command": "yuvadev-ai.refactor",
+                    "group": "navigation@2"
+                },
+                {
+                    "command": "yuvadev-ai.generateApp",
+                    "group": "navigation@3"
+                },
+                {
+                    "command": "yuvadev-ai.fixErrors",
+                    "group": "navigation@4"
+                },
+                {
+                    "command": "yuvadev-ai.addTests",
+                    "group": "navigation@5"
+                }
+            ]
+        },
+        "configuration": {
+            "title": "YuvaDev AI",
+            "properties": {
+                "yuvadev.showChatOnStartup": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Show the YuvaDev Chat panel automatically on workspace startup"
+                },
+                "yuvadev.backendPath": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Absolute path to the yuvadev-backend directory (contains main.py). Leave empty for auto-detection."
+                }
+            }
+        },
+        "viewsContainers": {
+            "activitybar": [
+                {
+                    "id": "yuvadev-ai-sidebar",
+                    "title": "YuvaDev AI",
+                    "icon": "resources/icon.svg"
+                },
+                {
+                    "id": "yuvadev",
+                    "title": "YuvaDev",
+                    "icon": "$(robot)"
+                }
+            ],
+            "panel": [
+                {
+                    "id": "yuvadev-ai-workspace-panel",
+                    "title": "YuvaDev Workspace",
+                    "icon": "$(robot)"
+                }
+            ]
+        },
+        "views": {
+            "yuvadev-ai-sidebar": [
+                {
+                    "type": "webview",
+                    "id": "yuvadev-ai.hubView",
+                    "name": "YuvaDev Hub"
+                },
+                {
+                    "type": "webview",
+                    "id": "yuvadev-ai.chatView",
+                    "name": "YuvaDev Chat"
+                },
+                {
+                    "type": "webview",
+                    "id": "yuvadev-ai.workspaceView",
+                    "name": "AI Workspace"
+                }
+            ],
+            "yuvadev": [
+                {
+                    "type": "webview",
+                    "id": "yuvadev.agentView",
+                    "name": "Agent"
+                }
+            ]
+        }
+    },
+    "scripts": {
+        "vscode:prepublish": "npm run compile",
+        "compile": "tsc -p ./",
+        "watch": "tsc -watch -p ./"
+    },
+    "dependencies": {
+        "ws": "^8.13.0"
+    },
+    "bundledDependencies": [
+        "ws"
+    ],
+    "devDependencies": {
+        "@types/vscode": "^1.80.0",
+        "@types/node": "^18.x",
+        "@types/ws": "^8.5.5",
+        "typescript": "^5.0.0"
+    }
+}

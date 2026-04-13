@@ -15,7 +15,6 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 
-import { OnboardingWizard } from './ui/onboarding';
 import { ChatViewProvider } from './ui/chat/ChatViewProvider';
 import { HubViewProvider } from './ui/hub/HubViewProvider';
 import { ProfileManager } from './utils/ProfileManager';
@@ -30,6 +29,12 @@ import { AgentApprovalHandler } from './services/AgentApprovalHandler';
 import { AgentActivityPanel } from './ui/agent/AgentActivityPanel';
 import { AgentWorkspaceView } from './ui/agent/AgentWorkspaceView';
 import { ArtifactStore } from './services/ArtifactStore';
+import { KeychainService } from './services/KeychainService';
+import { BackendClient } from './services/BackendClient';
+import { SettingsPanel } from './ui/SettingsPanel';
+import { OnboardingPanel } from './panels/OnboardingPanel';
+import { AgentPanel } from './panels/AgentPanel';
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Activation
@@ -43,6 +48,16 @@ export function activate(context: vscode.ExtensionContext): void {
     const healthService = new HealthService(backendService);
     const agentLoopService = new AgentLoopService(context);
     const approvalHandler = new AgentApprovalHandler();
+
+    // ── Key management ────────────────────────────────────────────────
+    const keychain = new KeychainService(context.secrets);
+    const backendClient = new BackendClient(keychain);
+    const agentPanel = new AgentPanel(context, backendClient);
+
+    // ── Context keys used by keybindings ─────────────────────────────
+    void vscode.commands.executeCommand('setContext', 'yuvadev.agentRunning', false);
+    void vscode.commands.executeCommand('setContext', 'yuvadev.pendingApproval', false);
+    void vscode.commands.executeCommand('setContext', 'yuvadev.hasPendingChanges', false);
 
     // ── UI singletons ───────────────────────────────────────────────
     const statusBar = new YuvaDevStatusBar(context);
@@ -61,6 +76,11 @@ export function activate(context: vscode.ExtensionContext): void {
     const chatProvider = new ChatViewProvider(context);
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, chatProvider)
+    );
+
+    // ── Agent Activity sidebar view ─────────────────────────────────
+    context.subscriptions.push(
+        vscode.window.registerWebviewViewProvider(AgentPanel.viewType, agentPanel)
     );
 
     // ── Wire status events → UI ──────────────────────────────────────────
@@ -85,7 +105,17 @@ export function activate(context: vscode.ExtensionContext): void {
     AgentActivityPanel.init(workspaceView);
 
     // ── Commands ──────────────────────────────────────────────────────
-    _registerCommands(context, backendService, chatProvider, agentLoopService, approvalHandler, workspaceView);
+    _registerCommands(
+        context,
+        backendService,
+        chatProvider,
+        agentLoopService,
+        approvalHandler,
+        workspaceView,
+        keychain,
+        backendClient,
+        agentPanel,
+    );
 
     // ── Background health polling ─────────────────────────────────────
     healthService.start(30_000);
@@ -98,7 +128,7 @@ export function activate(context: vscode.ExtensionContext): void {
     agentLoopService.recoverSession().then(recovered => {
         if (!recovered) { return; }
         vscode.window.showInformationMessage(
-            `YuvaDev: Reconnecting to active agent session “${recovered.task}”`,
+            `YuvaDev: Reconnecting to active agent session "${recovered.task}"`,
             'Open Panel',
         ).then(pick => {
             if (pick === 'Open Panel') {
@@ -107,8 +137,10 @@ export function activate(context: vscode.ExtensionContext): void {
         });
     });
 
-    // ── Onboarding ──────────────────────────────────────────────────────
-    OnboardingWizard.show(context);
+    // ── First-launch onboarding wizard ───────────────────────────────
+    if (!context.globalState.get<boolean>('yuvadev.setupComplete')) {
+        OnboardingPanel.show(context, keychain, backendClient);
+    }
 
     // ── Auto-show chat ─────────────────────────────────────────────────
     const cfg = vscode.workspace.getConfiguration('yuvadev');
@@ -130,8 +162,50 @@ function _registerCommands(
     agentLoop: AgentLoopService,
     approvalHandler: AgentApprovalHandler,
     workspaceView: AgentWorkspaceView,
+    keychain: KeychainService,
+    backendClient: BackendClient,
+    agentPanel: AgentPanel,
 ): void {
     const reg = (...d: vscode.Disposable[]) => context.subscriptions.push(...d);
+
+    // ── Settings panel ────────────────────────────────────────────────────────
+    reg(
+        vscode.commands.registerCommand('yuvadev-ai.openSettings', () => {
+            SettingsPanel.show(context, keychain, backendClient);
+        })
+    );
+
+    reg(
+        vscode.commands.registerCommand('yuvadev.openSettings', () => {
+            SettingsPanel.show(context, keychain, backendClient);
+        }),
+        vscode.commands.registerCommand('yuvadev.restart', async () => {
+            backend.stop();
+            await backend.start();
+        }),
+        vscode.commands.registerCommand('yuvadev.showOnboarding', () => {
+            OnboardingPanel.show(context, keychain, backendClient);
+        }),
+        vscode.commands.registerCommand('yuvadev.triggerAgent', async () => {
+            await vscode.commands.executeCommand('workbench.view.extension.yuvadev');
+            const taskFromInput = agentPanel.getTaskInput().trim();
+            if (taskFromInput) {
+                await agentPanel.startAgent(taskFromInput);
+                return;
+            }
+            const fallback = await vscode.window.showInputBox({
+                placeHolder: 'Describe what you want YuvaDev to build...',
+                prompt: 'YuvaDev Agent Task',
+                ignoreFocusOut: true,
+            });
+            if (fallback?.trim()) {
+                await agentPanel.startAgent(fallback.trim());
+            }
+        }),
+        vscode.commands.registerCommand('yuvadev.approveAction', () => agentPanel.approve()),
+        vscode.commands.registerCommand('yuvadev.rejectAction', () => agentPanel.reject()),
+        vscode.commands.registerCommand('yuvadev.stopAgent', () => agentPanel.stop()),
+    );
 
     // Backend lifecycle
     reg(
