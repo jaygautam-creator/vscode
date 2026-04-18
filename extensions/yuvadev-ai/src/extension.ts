@@ -23,7 +23,7 @@ import { PlanVisualizationPanel } from './ui/planPanel';
 import { ConfidenceDiffPanel } from './ui/diffPanel';
 import { OllamaService } from './services/OllamaService';
 import { BackendService } from './services/BackendService';
-import { HealthService } from './services/HealthService';
+import { BackendProcess } from './services/BackendProcess';
 import { AgentLoopService } from './services/AgentLoopService';
 import { AgentApprovalHandler } from './services/AgentApprovalHandler';
 import { AgentActivityPanel } from './ui/agent/AgentActivityPanel';
@@ -34,25 +34,76 @@ import { BackendClient } from './services/BackendClient';
 import { SettingsPanel } from './ui/SettingsPanel';
 import { OnboardingPanel } from './panels/OnboardingPanel';
 import { AgentPanel } from './panels/AgentPanel';
+import { DiffPreviewService } from './services/DiffPreviewService';
+import { UpdateChecker } from './services/UpdateChecker';
+import { LoginPanel } from './panels/LoginPanel';
+import { PluginsPanel } from './panels/PluginsPanel';
+import { HistoryPanelProvider } from './panels/HistoryPanel';
+import { AgentCodeLensProvider } from './ui/agentCodeLens';
+
+const BACKEND_PORT = 8125;
+
+async function checkBackendHealth(): Promise<boolean> {
+    try {
+        const res = await fetch(`http://localhost:${BACKEND_PORT}/health`, {
+            signal: AbortSignal.timeout(2000),
+        });
+        return res.ok;
+    } catch {
+        return false;
+    }
+}
+
+function resolveBackendLaunchDir(): string | undefined {
+    const configured = vscode.workspace.getConfiguration('yuvadev').get<string>('backendPath')?.trim();
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+
+    const candidates = [
+        configured,
+        workspaceFolder ? path.join(workspaceFolder, 'yuvadev-backend') : undefined,
+        workspaceFolder ? path.join(workspaceFolder, '..', 'yuvadev-backend') : undefined,
+        workspaceFolder,
+    ].filter((candidate): candidate is string => Boolean(candidate));
+
+    return candidates.find((candidate) => {
+        try {
+            return require('fs').existsSync(path.join(candidate, 'main.py'));
+        } catch {
+            return false;
+        }
+    });
+}
 
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Activation
 // ─────────────────────────────────────────────────────────────────────────────
 
-export function activate(context: vscode.ExtensionContext): void {
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
     // ── Core services ─────────────────────────────────────────────────
     ProfileManager.initialize(context);
     const ollamaService = new OllamaService();
     const backendService = new BackendService(context, ollamaService);
-    const healthService = new HealthService(backendService);
+    const backendProcess = new BackendProcess();
     const agentLoopService = new AgentLoopService(context);
     const approvalHandler = new AgentApprovalHandler();
 
     // ── Key management ────────────────────────────────────────────────
     const keychain = new KeychainService(context.secrets);
     const backendClient = new BackendClient(keychain);
-    const agentPanel = new AgentPanel(context, backendClient);
+    const agentPanel = new AgentPanel(context, backendClient, keychain, ollamaService);
+    const diffPreviewService = new DiffPreviewService(backendClient);
+    let logoutRequested = false;
+
+    context.subscriptions.push({
+        dispose: () => {
+            if (!logoutRequested) {
+                return;
+            }
+            void keychain.clearAllProviderKeys();
+            void keychain.clearCloudSession();
+        },
+    });
 
     // ── Context keys used by keybindings ─────────────────────────────
     void vscode.commands.executeCommand('setContext', 'yuvadev.agentRunning', false);
@@ -62,6 +113,31 @@ export function activate(context: vscode.ExtensionContext): void {
     // ── UI singletons ───────────────────────────────────────────────
     const statusBar = new YuvaDevStatusBar(context);
     statusBar.setStatus('offline');
+
+    backendClient.setUnauthorizedHandler(async () => {
+        LoginPanel.show(context, backendClient, keychain, async (email) => {
+            statusBar.setAccountEmail(email);
+        });
+    });
+
+    void (async () => {
+        const savedEmail = await keychain.getAccountEmail();
+        if (savedEmail) {
+            statusBar.setAccountEmail(savedEmail);
+            return;
+        }
+
+        const accessToken = await keychain.getAccessToken();
+        if (!accessToken) {
+            return;
+        }
+
+        const user = await backendClient.getCurrentUser();
+        if (user?.email) {
+            await keychain.storeAccountEmail(user.email);
+            statusBar.setAccountEmail(user.email);
+        }
+    })();
 
     const diffPanel = new ConfidenceDiffPanel(context);
     context.subscriptions.push(diffPanel);
@@ -83,16 +159,58 @@ export function activate(context: vscode.ExtensionContext): void {
         vscode.window.registerWebviewViewProvider(AgentPanel.viewType, agentPanel)
     );
 
-    // ── Wire status events → UI ──────────────────────────────────────────
-    backendService.onStatusChange(status => {
-        hubProvider.setStatus(status);
-        statusBar.setStatus(status as any);
-    });
+    // ── Agent History sidebar view ──────────────────────────────────
+    const historyProvider = new HistoryPanelProvider(backendClient);
+    context.subscriptions.push(
+        vscode.window.registerWebviewViewProvider(HistoryPanelProvider.viewType, historyProvider)
+    );
+
+    // ── CodeLenses ──────────────────────────────────────────────────
+    context.subscriptions.push(
+        vscode.languages.registerCodeLensProvider(['python', 'typescript', 'javascript'], new AgentCodeLensProvider())
+    );
+
     ollamaService.onStatusChange(status => hubProvider.setOllamaStatus(status));
 
     // NOTE: We do NOT probe Ollama on activation — the status indicator should
     // only turn green when the user explicitly clicks "Start Backend".
     // Auto-probing caused Ollama to always appear "online" on every window open.
+
+    const startBackendWithProgress = async (forceRestart = false): Promise<boolean> => {
+        if (forceRestart) {
+            backendProcess.stop();
+        }
+
+        statusBar.setStatus('starting');
+        hubProvider.setStatus('starting');
+
+        const ok = await vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: 'Starting YuvaDev backend...',
+            cancellable: false,
+        }, async () => backendProcess.start(context));
+
+        if (ok) {
+            statusBar.setStatus('online');
+            hubProvider.setStatus('online');
+            return true;
+        }
+
+        statusBar.setStatus('offline');
+        hubProvider.setStatus('offline');
+        vscode.window.showErrorMessage('YuvaDev backend failed to start. Check Output panel.');
+        return false;
+    };
+
+    const stopBackendProcess = (): void => {
+        backendProcess.stop();
+        statusBar.setStatus('offline');
+        hubProvider.setStatus('offline');
+    };
+
+    context.subscriptions.push({
+        dispose: () => stopBackendProcess(),
+    });
 
     // ── AI Workspace (Phase 4 — permanent 3-tab sidebar) ──────────────────
     const artifactStore = new ArtifactStore(context.workspaceState);
@@ -107,7 +225,6 @@ export function activate(context: vscode.ExtensionContext): void {
     // ── Commands ──────────────────────────────────────────────────────
     _registerCommands(
         context,
-        backendService,
         chatProvider,
         agentLoopService,
         approvalHandler,
@@ -115,14 +232,27 @@ export function activate(context: vscode.ExtensionContext): void {
         keychain,
         backendClient,
         agentPanel,
+        diffPreviewService,
+        statusBar,
+        () => {
+            logoutRequested = true;
+        },
+        startBackendWithProgress,
+        stopBackendProcess,
     );
 
-    // ── Background health polling ─────────────────────────────────────
-    healthService.start(30_000);
-    context.subscriptions.push(healthService);
+    if (await checkBackendHealth()) {
+        statusBar.setStatus('online');
+        hubProvider.setStatus('online');
+    } else {
+        await startBackendWithProgress(false);
+    }
+
+    // ── Background services ───────────────────────────────────────────
     context.subscriptions.push(backendService);
     context.subscriptions.push(agentLoopService);
     context.subscriptions.push(approvalHandler);
+    context.subscriptions.push(diffPreviewService);
 
     // ── Session recovery: reconnect to any running agent loop ────────────
     agentLoopService.recoverSession().then(recovered => {
@@ -147,6 +277,34 @@ export function activate(context: vscode.ExtensionContext): void {
     if (cfg.get<boolean>('showChatOnStartup', true)) {
         vscode.commands.executeCommand('workbench.view.extension.yuvadev-ai-sidebar');
     }
+
+    // ── Daily update check (private release feed) ──────────────────────
+    void (async () => {
+        const checker = new UpdateChecker();
+        const extensionVersion = String(context.extension.packageJSON?.version ?? '0.0.0').replace(/^v/, '');
+        const lastCheck = context.globalState.get<number>('yuvadev.lastUpdateCheck', 0);
+        const oneDayMs = 86_400_000;
+
+        if (Date.now() - lastCheck <= oneDayMs) {
+            return;
+        }
+
+        await context.globalState.update('yuvadev.lastUpdateCheck', Date.now());
+        const update = await checker.checkForUpdate(extensionVersion);
+        if (!update?.available) {
+            return;
+        }
+
+        const choice = await vscode.window.showInformationMessage(
+            `YuvaDev ${update.version} is available.`,
+            'Download update',
+            'Later',
+        );
+
+        if (choice === 'Download update' && update.downloadUrl) {
+            await vscode.env.openExternal(vscode.Uri.parse(update.downloadUrl));
+        }
+    })();
 }
 
 export function deactivate(): void { /* services disposed via context.subscriptions */ }
@@ -157,7 +315,6 @@ export function deactivate(): void { /* services disposed via context.subscripti
 
 function _registerCommands(
     context: vscode.ExtensionContext,
-    backend: BackendService,
     chat: ChatViewProvider,
     agentLoop: AgentLoopService,
     approvalHandler: AgentApprovalHandler,
@@ -165,6 +322,11 @@ function _registerCommands(
     keychain: KeychainService,
     backendClient: BackendClient,
     agentPanel: AgentPanel,
+    diffPreviewService: DiffPreviewService,
+    statusBar: YuvaDevStatusBar,
+    markLogoutRequested: () => void,
+    startBackend: (forceRestart?: boolean) => Promise<boolean>,
+    stopBackend: () => void,
 ): void {
     const reg = (...d: vscode.Disposable[]) => context.subscriptions.push(...d);
 
@@ -172,6 +334,14 @@ function _registerCommands(
     reg(
         vscode.commands.registerCommand('yuvadev-ai.openSettings', () => {
             SettingsPanel.show(context, keychain, backendClient);
+        }),
+        vscode.commands.registerCommand('yuvadev-ai.openWorkspace', async () => {
+            await vscode.commands.executeCommand('workbench.view.extension.yuvadev-ai-workspace-panel');
+            await vscode.commands.executeCommand('yuvadev-ai.workspaceView.focus');
+        }),
+        vscode.commands.registerCommand('yuvadev-ai.improveFunction', async (functionName: string, fileName: string) => {
+            const text = `/edit Improve the function ${functionName} in ${fileName}`;
+            await vscode.commands.executeCommand('yuvadev-ai.cmdK', text);
         })
     );
 
@@ -179,12 +349,35 @@ function _registerCommands(
         vscode.commands.registerCommand('yuvadev.openSettings', () => {
             SettingsPanel.show(context, keychain, backendClient);
         }),
+        vscode.commands.registerCommand('yuvadev.showLogin', () => {
+            LoginPanel.show(context, backendClient, keychain, async (email) => {
+                statusBar.setAccountEmail(email);
+            });
+        }),
+        vscode.commands.registerCommand('yuvadev.logout', async () => {
+            markLogoutRequested();
+            try {
+                await backendClient.logout();
+            } catch {
+                await keychain.clearAllProviderKeys();
+                await keychain.clearCloudSession();
+            }
+            statusBar.setAccountEmail(null);
+            vscode.window.showInformationMessage('Signed out of YuvaDev Cloud and cleared stored API keys.');
+        }),
         vscode.commands.registerCommand('yuvadev.restart', async () => {
-            backend.stop();
-            await backend.start();
+            const ok = await startBackend(true);
+            if (!ok) {
+                vscode.window.showErrorMessage(
+                    'YuvaDev backend failed to start. Check Output panel for diagnostics.',
+                );
+            }
         }),
         vscode.commands.registerCommand('yuvadev.showOnboarding', () => {
             OnboardingPanel.show(context, keychain, backendClient);
+        }),
+        vscode.commands.registerCommand('yuvadev.openPlugins', () => {
+            PluginsPanel.show(context, backendClient);
         }),
         vscode.commands.registerCommand('yuvadev.triggerAgent', async () => {
             await vscode.commands.executeCommand('workbench.view.extension.yuvadev');
@@ -205,12 +398,35 @@ function _registerCommands(
         vscode.commands.registerCommand('yuvadev.approveAction', () => agentPanel.approve()),
         vscode.commands.registerCommand('yuvadev.rejectAction', () => agentPanel.reject()),
         vscode.commands.registerCommand('yuvadev.stopAgent', () => agentPanel.stop()),
+        vscode.commands.registerCommand('yuvadev.showDiffPreview', async (sessionId?: string) => {
+            const resolvedSessionId =
+                (typeof sessionId === 'string' && sessionId) ||
+                agentPanel.currentSessionId ||
+                agentLoop.currentSession?.sessionId;
+
+            if (!resolvedSessionId) {
+                vscode.window.showWarningMessage('YuvaDev: No active session with pending changes.');
+                return;
+            }
+
+            try {
+                const committed = await diffPreviewService.showDiffAndCommit(resolvedSessionId);
+                if (committed) {
+                    agentPanel.clearCommittedSession(resolvedSessionId);
+                    void vscode.commands.executeCommand('setContext', 'yuvadev.hasPendingChanges', false);
+                }
+            } catch (err: any) {
+                vscode.window.showErrorMessage(`YuvaDev: ${err.message ?? 'Failed to review pending changes.'}`);
+            }
+        }),
     );
 
     // Backend lifecycle
     reg(
-        vscode.commands.registerCommand('yuvadev-ai.startBackend', () => backend.start()),
-        vscode.commands.registerCommand('yuvadev-ai.stopBackend', () => backend.stop()),
+        vscode.commands.registerCommand('yuvadev-ai.startBackend', async () => {
+            await startBackend(false);
+        }),
+        vscode.commands.registerCommand('yuvadev-ai.stopBackend', () => stopBackend()),
     );
 
     // Apply code — registered VS Code command so any handler can call it
@@ -244,10 +460,17 @@ function _registerCommands(
                 });
                 await editor.document.save();
                 vscode.window.showInformationMessage(
-                    `YuvaDev applied changes to \${path.basename(editor.document.fileName)}`
+                    `YuvaDev applied changes to ${path.basename(editor.document.fileName)}`
                 );
             }
         )
+    );
+
+    reg(
+        vscode.commands.registerCommand('yuvadev-ai.openHub', async () => {
+            await vscode.commands.executeCommand('workbench.view.extension.yuvadev-ai-sidebar');
+            await vscode.commands.executeCommand('yuvadev-ai.hubView.focus');
+        })
     );
 
     // Chat panel toggle
@@ -266,8 +489,8 @@ function _registerCommands(
 
     // Cmd+K
     reg(
-        vscode.commands.registerCommand('yuvadev-ai.cmdK', async () => {
-            const input = await vscode.window.showInputBox({
+        vscode.commands.registerCommand('yuvadev-ai.cmdK', async (prefill?: string) => {
+            const input = prefill || await vscode.window.showInputBox({
                 placeHolder: 'Tell YuvaDev what to do\u2026',
                 prompt: 'Universal AI Execution',
             });
@@ -479,7 +702,7 @@ function _openAgentDashboard(context: vscode.ExtensionContext, ipcToken: string)
     panel.webview.html = _agentHtml();
     panel.webview.onDidReceiveMessage(message => {
         if (message.command !== 'runTask') { return; }
-        const wsUrl = 'ws://127.0.0.1:8124/api/v3/agent/ws/agent/run';
+        const wsUrl = 'ws://127.0.0.1:8125/api/v3/agent/ws/agent/run';
         const headers: Record<string, string> = {
             'origin': 'vscode-webview://',
             'x-yuvadev-token': ipcToken,
@@ -511,7 +734,7 @@ function _openAccountSettings(context: vscode.ExtensionContext): void {
     panel.webview.onDidReceiveMessage(async (msg) => {
         if (msg.command !== 'login') { return; }
         try {
-            const res = await fetch('http://127.0.0.1:8124/api/auth/login', {
+            const res = await fetch('http://127.0.0.1:8125/api/auth/login', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ email: msg.email, password: msg.password }),
@@ -524,7 +747,7 @@ function _openAccountSettings(context: vscode.ExtensionContext): void {
                 vscode.window.showErrorMessage('Login failed. Check your credentials.');
             }
         } catch {
-            vscode.window.showErrorMessage('Cannot reach YuvaDev backend on port 8124.');
+            vscode.window.showErrorMessage('Cannot reach YuvaDev backend on port 8125.');
         }
     }, undefined, context.subscriptions);
 }
