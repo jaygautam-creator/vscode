@@ -197,6 +197,8 @@ class YuvaDevBackendSupervisor extends Disposable {
 		}
 
 		const appRoot = this.environmentMainService.appRoot;
+		candidates.add(nodePath.resolve(appRoot, 'extensions', 'yuvadev-ai', 'backend'));
+		candidates.add(nodePath.resolve(appRoot, 'extensions', 'yuvadev-assistant', 'backend'));
 		candidates.add(nodePath.resolve(appRoot, '..', 'yuvadev-backend'));
 		candidates.add(nodePath.resolve(appRoot, '..', '..', 'yuvadev-backend'));
 		candidates.add(nodePath.resolve(appRoot, '..', '..', '..', 'yuvadev-backend'));
